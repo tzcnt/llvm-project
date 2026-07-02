@@ -60,7 +60,71 @@ private:
 };
 } // namespace
 
+// Try to statically resolve the function pointer that lowering \p SubFn would
+// load from the coroutine frame, by scanning backwards for the store that
+// initialized the slot. CoroCleanup creates these loads after the last run of
+// GVN, so no later pass can forward the store. Forwarding it turns the
+// symmetric transfer to a just-initialized (e.g. elided) coroutine frame into
+// a direct tail call.
+//
+// Frame accesses are constant-offset geps off the frame pointer, so a
+// structural (base, offset) disjointness check is sufficient; bail on any
+// intervening write we cannot reason about that way.
+static Value *findStoredSubFnValue(CoroSubFnInst *SubFn) {
+  constexpr unsigned MaxInstsToScan = 64;
+  const DataLayout &DL = SubFn->getModule()->getDataLayout();
+  Value *FramePtr = SubFn->getFrame();
+  unsigned IndexWidth = DL.getIndexTypeSizeInBits(FramePtr->getType());
+  uint64_t PtrSize = DL.getTypeStoreSize(SubFn->getType());
+
+  APInt FrameOff(IndexWidth, 0);
+  Value *Base = FramePtr->stripAndAccumulateConstantOffsets(
+      DL, FrameOff, /*AllowNonInbounds=*/true);
+  // The slot occupies [SlotBegin, SlotEnd) relative to Base.
+  APInt SlotBegin = FrameOff + SubFn->getIndex() * PtrSize;
+  APInt SlotEnd = SlotBegin + PtrSize;
+
+  unsigned Scanned = 0;
+  for (Instruction &I : make_range(++SubFn->getReverseIterator(),
+                                   SubFn->getParent()->rend())) {
+    if (++Scanned > MaxInstsToScan)
+      return nullptr;
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      APInt StoreOff(IndexWidth, 0);
+      Value *StoreBase =
+          SI->getPointerOperand()->stripAndAccumulateConstantOffsets(
+              DL, StoreOff, /*AllowNonInbounds=*/true);
+      uint64_t StoreSize =
+          DL.getTypeStoreSize(SI->getValueOperand()->getType());
+      // A store through an unknown base may alias the slot.
+      if (StoreBase != Base)
+        return nullptr;
+      // The store that initialized the slot.
+      if (StoreOff == SlotBegin && StoreSize == PtrSize &&
+          SI->getValueOperand()->getType()->isPointerTy() && !SI->isVolatile())
+        return SI->getValueOperand();
+      // Disjoint constant-offset ranges within the same object cannot alias.
+      if ((StoreOff + StoreSize).sle(SlotBegin) || StoreOff.sge(SlotEnd))
+        continue;
+      return nullptr;
+    }
+    if (auto *CB = dyn_cast<CallBase>(&I)) {
+      if (!CB->mayWriteToMemory())
+        continue;
+      return nullptr;
+    }
+    if (I.mayWriteToMemory())
+      return nullptr;
+  }
+  return nullptr;
+}
+
 static void lowerSubFn(IRBuilder<> &Builder, CoroSubFnInst *SubFn) {
+  if (Value *Stored = findStoredSubFnValue(SubFn)) {
+    SubFn->replaceAllUsesWith(Stored);
+    return;
+  }
+
   Builder.SetInsertPoint(SubFn);
   Value *FramePtr = SubFn->getFrame();
   int Index = SubFn->getIndex();

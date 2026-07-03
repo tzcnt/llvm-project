@@ -28,6 +28,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/PassManager.h"
@@ -384,6 +385,7 @@ private:
   /// probabilities on branches.
   bool calcEstimatedHeuristics(const BasicBlock *BB);
   bool calcMetadataWeights(const BasicBlock *BB);
+  bool calcCoroutineHeuristics(const BasicBlock *BB);
   bool calcPointerHeuristics(const BasicBlock *BB);
   bool calcZeroHeuristics(const BasicBlock *BB, const TargetLibraryInfo *TLI);
   bool calcFloatingPointHeuristics(const BasicBlock *BB);
@@ -1145,6 +1147,134 @@ bool BPIConstruction::calcEstimatedHeuristics(const BasicBlock *BB) {
   return true;
 }
 
+/// Returns the switch instruction if \p BB is terminated by a switch on the
+/// result of a llvm.coro.suspend intrinsic, otherwise nullptr.
+static const SwitchInst *getCoroSuspendSwitch(const BasicBlock *BB) {
+  const auto *SI = dyn_cast<SwitchInst>(BB->getTerminator());
+  if (!SI)
+    return nullptr;
+  const auto *Intr = dyn_cast<IntrinsicInst>(SI->getCondition());
+  if (!Intr || Intr->getIntrinsicID() != Intrinsic::coro_suspend)
+    return nullptr;
+  return SI;
+}
+
+/// Returns the successor of the coro.suspend switch \p SI that is taken when
+/// the suspended coroutine is resumed (case value 0), or nullptr if the
+/// switch has no such case.
+static const BasicBlock *getCoroResumeSuccessor(const SwitchInst *SI) {
+  auto *Zero = ConstantInt::get(
+      cast<IntegerType>(SI->getCondition()->getType()), 0);
+  auto Case = SI->findCaseValue(Zero);
+  if (Case == SI->case_default())
+    return nullptr;
+  return Case->getCaseSuccessor();
+}
+
+// Weights for the structural control flow of an unlowered (presplit)
+// coroutine. A suspended coroutine is almost always resumed exactly once, so
+// the resume case of the coro.suspend dispatch is overwhelmingly likely
+// relative to early destruction, and code following a suspend point executes
+// (nearly) once per entry into the coroutine.
+static const uint32_t CORO_RESUME_WEIGHT = 1 << 20;
+static const uint32_t CORO_NONRESUME_WEIGHT = 1;
+
+/// Calculate edge probabilities for the control flow that materializes
+/// suspend points in an unlowered (presplit) coroutine.
+///
+/// Before CoroSplit, every co_await lowers to a three-way switch on the
+/// result of llvm.coro.suspend (fall through to the ramp's return, resume,
+/// or destroy), typically followed by a shared cleanup block that dispatches
+/// on a constant PHI. Generic heuristics treat these as ordinary branches,
+/// which compounds a large spurious dilution onto the estimated frequency of
+/// every block that follows a suspend point (roughly a 3.2x reduction per
+/// suspend point in straight-line code). Model the resume path as
+/// overwhelmingly likely so that block frequencies within presplit coroutine
+/// bodies reflect genuine branch conditions rather than the mechanics of
+/// suspension. This matters for frequency-based decisions made on the
+/// presplit coroutine, such as CoroAnnotationElide's hotness gate.
+bool BPIConstruction::calcCoroutineHeuristics(const BasicBlock *BB) {
+  if (!BB->getParent()->isPresplitCoroutine())
+    return false;
+
+  // The suspend dispatch:
+  //   %s = call i8 @llvm.coro.suspend(token %save, i1 false)
+  //   switch i8 %s, label %suspend.ret [i8 0, label %resume
+  //                                     i8 1, label %destroy]
+  // Treat the resume successor as overwhelmingly likely.
+  if (const SwitchInst *SI = getCoroSuspendSwitch(BB)) {
+    const BasicBlock *ResumeBB = getCoroResumeSuccessor(SI);
+    // A final suspend cannot be resumed; its resume successor is
+    // unreachable. Leave such switches to the generic heuristics.
+    if (!ResumeBB || isa<UnreachableInst>(ResumeBB->getTerminator()))
+      return false;
+
+    SmallVector<uint32_t, 4> Weights;
+    uint64_t TotalWeight = 0;
+    for (const BasicBlock *Succ : successors(BB)) {
+      uint32_t Weight =
+          Succ == ResumeBB ? CORO_RESUME_WEIGHT : CORO_NONRESUME_WEIGHT;
+      Weights.push_back(Weight);
+      TotalWeight += Weight;
+    }
+    SmallVector<BranchProbability, 4> EdgeProbabilities;
+    for (uint32_t Weight : Weights)
+      EdgeProbabilities.push_back(
+          BranchProbability::getBranchProbability(Weight, TotalWeight));
+    BPI.setEdgeProbability(BB, EdgeProbabilities);
+    return true;
+  }
+
+  // The shared cleanup dispatch that routes control after the suspend:
+  //   %dest = phi i32 [ 0, %resume ], [ 2, %destroy ]
+  //   %cmp = icmp eq i32 %dest, 0
+  //   br i1 %cmp, label %cleanup.cont, label %coro.cleanup
+  // The comparison folds to a known result along every incoming edge, so
+  // weight the two outcomes by their incoming edges, discounting edges that
+  // originate from a non-resume case of a suspend switch. Without this, the
+  // generic `eq`-compare heuristic estimates the always-taken fallthrough
+  // path at 37.5%.
+  const auto *BI = dyn_cast<CondBrInst>(BB->getTerminator());
+  if (!BI)
+    return false;
+  const auto *CI = dyn_cast<ICmpInst>(BI->getCondition());
+  if (!CI || !CI->isEquality())
+    return false;
+  const auto *Phi = dyn_cast<PHINode>(CI->getOperand(0));
+  const auto *CV = dyn_cast<ConstantInt>(CI->getOperand(1));
+  if (!Phi || !CV || Phi->getParent() != BB)
+    return false;
+
+  uint64_t TakenWeight = 0;
+  uint64_t NotTakenWeight = 0;
+  for (unsigned I = 0, E = Phi->getNumIncomingValues(); I != E; ++I) {
+    const auto *Incoming = dyn_cast<ConstantInt>(Phi->getIncomingValue(I));
+    if (!Incoming)
+      return false;
+    bool Taken = Incoming->getValue() == CV->getValue();
+    if (CI->getPredicate() == ICmpInst::ICMP_NE)
+      Taken = !Taken;
+    uint32_t Weight = CORO_RESUME_WEIGHT;
+    if (const SwitchInst *PredSI =
+            getCoroSuspendSwitch(Phi->getIncomingBlock(I)))
+      if (getCoroResumeSuccessor(PredSI) != BB)
+        Weight = CORO_NONRESUME_WEIGHT;
+    (Taken ? TakenWeight : NotTakenWeight) += Weight;
+  }
+  if (TakenWeight + NotTakenWeight == 0)
+    return false;
+  // Keep both edges reachable.
+  TakenWeight = std::max<uint64_t>(TakenWeight, 1);
+  NotTakenWeight = std::max<uint64_t>(NotTakenWeight, 1);
+
+  BranchProbability TakenProb = BranchProbability::getBranchProbability(
+      TakenWeight, TakenWeight + NotTakenWeight);
+  SmallVector<BranchProbability, 2> EdgeProbabilities{TakenProb,
+                                                      TakenProb.getCompl()};
+  BPI.setEdgeProbability(BB, EdgeProbabilities);
+  return true;
+}
+
 bool BPIConstruction::calcZeroHeuristics(const BasicBlock *BB,
                                          const TargetLibraryInfo *TLI) {
   const CondBrInst *BI = dyn_cast<CondBrInst>(BB->getTerminator());
@@ -1270,6 +1400,8 @@ void BPIConstruction::calculate(const Function &F, const LoopInfo &LoopI,
     if (BB->getTerminator()->getNumSuccessors() < 2)
       continue;
     if (calcMetadataWeights(BB))
+      continue;
+    if (calcCoroutineHeuristics(BB))
       continue;
     if (calcEstimatedHeuristics(BB))
       continue;

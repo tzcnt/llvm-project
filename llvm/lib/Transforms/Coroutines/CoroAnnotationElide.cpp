@@ -35,9 +35,16 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "coro-annotation-elide"
-
+// A straight-line co_await has a static BranchProbability of 0.3125 due to the
+// awaiter's await_ready() branch and the three-way coro.suspend switch. Each
+// subsequent co_await in the same coroutine multiplies this static probability
+// by 0.3125, so the perceived branch probability of the N-th co_await is
+// roughly 0.3125^N. Setting this to 0.001 allows 5 co_awaits in a straight-line
+// coroutine to be elided. Call sites that are genuinely cold via PGO or
+// annotated with [[unlikely]] (which has a static BranchProbability of ~0.0005)
+// will fall under this threshold.
 static cl::opt<float> CoroElideBranchRatio(
-    "coro-elide-branch-ratio", cl::init(0.55), cl::Hidden,
+    "coro-elide-branch-ratio", cl::init(0.001), cl::Hidden,
     cl::desc("Minimum BranchProbability to consider a elide a coroutine."));
 extern cl::opt<unsigned> MinBlockCounterExecution;
 

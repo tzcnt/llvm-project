@@ -1,10 +1,11 @@
 // This file tests that [[clang::coro_await_elidable]] results in the callee
-// coroutine's allocation actually being elided at -O2. It complements
-// coro-await-elidable.cpp, which only verifies that the frontend marks the
-// call sites with the coro_elide_safe attribute; the elision itself is
-// performed later, by CoroAnnotationElide in the middle end, subject to a
-// block frequency check of the call site in the (still unsplit, unsimplified)
-// caller.
+// coroutine's allocation actually being elided at -O2, and that
+// [[clang::coro_await_elidable_argument]] propagates the elision through a
+// wrapper coroutine's parameter. It complements coro-await-elidable.cpp,
+// which only verifies that the frontend marks the call sites with the
+// coro_elide_safe attribute; the elision itself is performed later, by
+// CoroAnnotationElide in the middle end, subject to a block frequency check
+// of the call site in the (still unsplit, unsimplified) caller.
 //
 // Allocations are made observable by giving the promise type an operator new
 // which calls an external marker function that optimization cannot remove or
@@ -23,9 +24,11 @@
 
 extern "C" void task_int_alloc();
 extern "C" void task_long_alloc();
+extern "C" void task_short_alloc();
 
 inline void note_alloc(int *) { task_int_alloc(); }
 inline void note_alloc(long *) { task_long_alloc(); }
+inline void note_alloc(short *) { task_short_alloc(); }
 
 template <typename T>
 struct [[clang::coro_await_elidable]] Task {
@@ -101,6 +104,24 @@ Task<long> caller_no_elide() {
   co_return co_await std::move(t);
 }
 
+// A wrapper coroutine with [[clang::coro_await_elidable_argument]] on its
+// first parameter only, mirroring addTasks() in coro-await-elidable.cpp.
+Task<short> wrapper([[clang::coro_await_elidable_argument]] Task<int> &&t1,
+                    Task<int> &&t2) {
+  int i1 = co_await t1;
+  int i2 = co_await t2;
+  co_return static_cast<short>(i1 + i2);
+}
+
+// Awaiting the wrapper as a prvalue elides the wrapper's own frame
+// (Task<short>), and the elide-safe context propagates through the
+// attributed parameter t1, eliding the first callee() frame as well. The
+// unattributed parameter t2 does not propagate it, so the second callee()
+// frame must still be heap-allocated.
+Task<long> caller_wrapper() {
+  co_return co_await wrapper(callee(), callee());
+}
+
 // The ramp functions each allocate their own coroutine's frame.
 //
 // CHECK-LABEL: define{{.*}} @_Z6calleev(
@@ -110,6 +131,12 @@ Task<long> caller_no_elide() {
 // CHECK: call void @task_long_alloc()
 //
 // CHECK-LABEL: define{{.*}} @_Z15caller_no_elidev(
+// CHECK: call void @task_long_alloc()
+//
+// CHECK-LABEL: define{{.*}} @_Z7wrapperO4TaskIiES1_(
+// CHECK: call void @task_short_alloc()
+//
+// CHECK-LABEL: define{{.*}} @_Z14caller_wrapperv(
 // CHECK: call void @task_long_alloc()
 
 // The body of caller() runs in its .resume function. Its await of callee()
@@ -125,3 +152,16 @@ Task<long> caller_no_elide() {
 //
 // CHECK-LABEL: define{{.*}} @_Z15caller_no_elidev.resume(
 // CHECK: call void @task_int_alloc()
+
+// The body of caller_wrapper() must elide the wrapper's frame (no
+// task_short_alloc) and, through the attributed parameter, the first
+// callee() frame; only the second callee() frame (the unattributed t2) may
+// be heap-allocated, so exactly one task_int_alloc call remains.
+//
+// CHECK-LABEL: define{{.*}} @_Z14caller_wrapperv.resume(
+// CHECK-NOT: call void @task_short_alloc()
+// CHECK: call void @task_int_alloc()
+// CHECK-NOT: call void @task_int_alloc()
+// CHECK-NOT: call void @task_short_alloc()
+//
+// CHECK-LABEL: define{{.*}} @_Z14caller_wrapperv.destroy(

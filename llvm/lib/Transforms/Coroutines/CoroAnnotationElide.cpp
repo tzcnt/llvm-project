@@ -36,9 +36,19 @@ using namespace llvm;
 
 #define DEBUG_TYPE "coro-annotation-elide"
 
+// BranchProbabilityInfo models the resume path of suspend points in the
+// (presplit) caller as overwhelmingly likely, so a directly awaited call
+// site in straight-line code is estimated at ~100% of the caller's entry
+// frequency regardless of how many suspend points precede it, and dilution
+// below the threshold reflects genuine branch conditions: profile data, an
+// explicit [[unlikely]] / __builtin_expect annotation (~0.05% of entry), or
+// statically cold paths. The default admits call sites at least ~10% likely
+// to execute per entry into the caller.
 static cl::opt<float> CoroElideBranchRatio(
-    "coro-elide-branch-ratio", cl::init(0.55), cl::Hidden,
-    cl::desc("Minimum BranchProbability to consider a elide a coroutine."));
+    "coro-elide-branch-ratio", cl::init(0.1), cl::Hidden,
+    cl::desc("Minimum ratio between the frequency of a coro_elide_safe call "
+             "site and the entry frequency of its caller for the callee "
+             "coroutine to be elided."));
 extern cl::opt<unsigned> MinBlockCounterExecution;
 
 static Instruction *getFirstNonAllocaInTheEntryBlock(Function *F) {

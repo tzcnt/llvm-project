@@ -1,7 +1,11 @@
 ; Coroutine calls marked with `coro_elide_safe` should be elided.
 ; Inside `caller`, we expect the `callee` coroutine to be elided.
-; Inside `caller_conditional`, `callee` is only called on an unlikely
-; path, hence we expect the `callee` coroutine NOT to be elided.
+; Inside `caller_conditional`, `callee` is called on a conditional path
+; carrying no evidence that the path is cold, hence we expect the `callee`
+; coroutine to be elided as well.
+; Inside `caller_conditional_unlikely`, `callee` is only called on a path
+; whose branch weights mark it as very unlikely, hence we expect the `callee`
+; coroutine NOT to be elided.
 ;
 ; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' | FileCheck %s
 
@@ -77,10 +81,35 @@ entry:
 ; Function Attrs: presplitcoroutine
 define ptr @caller_conditional(i1 %cond) #0 {
 entry:
+  ; CHECK: %[[TASK:.+]] = alloca %struct.Task, align 8
+  ; CHECK-NEXT: %[[FRAME:.+]] = alloca [32 x i8], align 8
+  ; CHECK-NEXT: br i1 %cond, label %call, label %ret
   br i1 %cond, label %call, label %ret
 
 call:
-  ; CHECK-NOT: alloca
+  ; CHECK: call:
+  ; CHECK-NEXT: call void @llvm.lifetime.start.p0(ptr %[[TASK]])
+  ; CHECK-NEXT: %[[ID:.+]] = call token @llvm.coro.id(i32 0, ptr null, ptr @callee, ptr @callee.resumers)
+  ; CHECK-NEXT: %[[HDL:.+]] = call ptr @llvm.coro.begin(token %[[ID]], ptr null)
+  ; CHECK-NEXT: store ptr %[[HDL]], ptr %[[TASK]], align 8
+  ; CHECK-NEXT: call void @llvm.lifetime.end.p0(ptr %[[TASK]])
+  ; CHECK-NEXT: br label %ret
+  %task = call ptr @callee(i8 0) coro_elide_safe
+  br label %ret
+
+ret:
+  %retval = phi ptr [ %task, %call ], [ null, %entry ]
+  ret ptr %retval
+}
+
+; CHECK-LABEL: define ptr @caller_conditional_unlikely(i1 %cond)
+; Function Attrs: presplitcoroutine
+define ptr @caller_conditional_unlikely(i1 %cond) #0 {
+entry:
+  br i1 %cond, label %call, label %ret, !prof !0
+
+call:
+  ; CHECK-NOT: alloca [32 x i8]
   ; CHECK-NOT: @llvm.coro.id({{.*}}, ptr @callee, {{.*}})
   ; CHECK: %task = call ptr @callee(i8 0)
   ; CHECK-NEXT: br label %ret
@@ -99,3 +128,5 @@ declare ptr @llvm.coro.subfn.addr(ptr, i8)
 declare i1 @llvm.coro.alloc(token)
 
 attributes #0 = { presplitcoroutine }
+
+!0 = !{!"branch_weights", i32 1, i32 2000}

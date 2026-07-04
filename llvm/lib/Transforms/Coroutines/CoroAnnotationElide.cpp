@@ -57,15 +57,19 @@ static cl::opt<float> CoroElideBranchRatio(
 // recursive task trees accrete into a single enormous root frame whose
 // working set far exceeds what heap allocation (with allocator block reuse)
 // would touch. Callee frames larger than this limit stay heap-allocated.
-// The default was chosen empirically on a fork-join task tree benchmark:
-// performance peaks in the 4-8 KiB range, degrades past 32 KiB, and falls
-// below no-elision-at-all past 128 KiB. Bounding the callee frame size (a
-// complete, temporally compact unit of work) measures better than bounding
-// the caller's accumulated total, which preferentially rejects the later
-// visited (larger, in postorder) children and fragments the task tree into
-// long-lived chains touched at widely separated fork and join times.
+// The default was chosen empirically on fork-join task tree benchmarks,
+// both statically instantiated and runtime-recursive: performance peaks in
+// the 4-8 KiB range (4 KiB is markedly better when the tree's depth varies
+// at runtime, because a rejected subtree frame is the block actually
+// allocated, and oversized blocks go mostly unused near the leaves),
+// degrades past 32 KiB, and falls below no-elision-at-all past 128 KiB.
+// Bounding the callee frame size (a complete, temporally compact unit of
+// work) measures better than bounding the caller's accumulated total, which
+// preferentially rejects the later visited (larger, in postorder) children
+// and fragments the task tree into long-lived chains touched at widely
+// separated fork and join times.
 static cl::opt<uint64_t> CoroElideMaxFrameSize(
-    "coro-elide-max-frame-size", cl::init(8192), cl::Hidden,
+    "coro-elide-max-frame-size", cl::init(4096), cl::Hidden,
     cl::desc("Maximum callee coroutine frame size, in bytes, that may be "
              "elided into a caller's frame. Larger callee frames remain "
              "dynamically allocated."));
@@ -78,7 +82,7 @@ static cl::opt<uint64_t> CoroElideMaxFrameSize(
 // join of dozens of tasks); at 4x the per-callee limit it never binds for
 // fan-outs of four or fewer maximum-size children.
 static cl::opt<uint64_t> CoroElideMaxAccumulatedFrameSize(
-    "coro-elide-max-accumulated-frame-size", cl::init(32768), cl::Hidden,
+    "coro-elide-max-accumulated-frame-size", cl::init(16384), cl::Hidden,
     cl::desc("Maximum total size, in bytes, of callee coroutine frames "
              "elided into any one caller's frame. Callee frames that do not "
              "fit under this limit remain dynamically allocated."));

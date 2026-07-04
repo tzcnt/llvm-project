@@ -2039,6 +2039,14 @@ def int_coro_subfn_addr : DefaultAttrsIntrinsic<
     [IntrReadMem, IntrArgMemOnly, ReadOnly<ArgIndex<0>>,
      NoCapture<ArgIndex<0>>]>;
 
+// Opaque identity of a coroutine function pointer. Emitted by
+// CoroRecursionPeel on the back edge of a peeled recursive coroutine so that
+// the call graph does not observe the recursive cycle while coroutine
+// splitting and elision decisions are being made; lowered to its argument by
+// CoroCleanup once those decisions are complete.
+def int_coro_recursion_anchor
+    : DefaultAttrsIntrinsic<[llvm_ptr_ty], [llvm_ptr_ty], [IntrNoMem]>;
+
 ///===------------------------- Other Intrinsics --------------------------===//
 //
 // TODO: We should introduce a new memory kind fo traps (and other side effects

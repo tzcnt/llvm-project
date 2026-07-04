@@ -146,7 +146,7 @@ entry:
   ret ptr %task2
 }
 
-; REMARK: 'callee_big' not elided in 'caller_big' because its frame is too large: 40000 (max: 8192)
+; REMARK: 'callee_big' not elided in 'caller_big' because its frame is too large: 40000 (max: 4096)
 ; REMARK2: 'callee_big' not elided in 'caller_twice' because the caller's accumulated elided frame size would be too large: 80000 (max: 65536)
 
 declare token @llvm.coro.id(i32, ptr, ptr, ptr)

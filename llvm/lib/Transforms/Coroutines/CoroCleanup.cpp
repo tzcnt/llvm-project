@@ -131,6 +131,9 @@ bool Lowerer::lower(Function &F) {
       case Intrinsic::coro_subfn_addr:
         lowerSubFn(Builder, cast<CoroSubFnInst>(II));
         break;
+      case Intrinsic::coro_recursion_anchor:
+        II->replaceAllUsesWith(II->getArgOperand(0));
+        break;
       case Intrinsic::coro_suspend_retcon:
       case Intrinsic::coro_is_in_ramp:
         if (IsPrivateAndUnprocessed) {
@@ -266,7 +269,8 @@ static bool declaresCoroCleanupIntrinsics(const Module &M) {
           Intrinsic::coro_dead, Intrinsic::coro_id, Intrinsic::coro_id_retcon,
           Intrinsic::coro_id_async, Intrinsic::coro_id_retcon_once,
           Intrinsic::coro_noop, Intrinsic::coro_async_size_replace,
-          Intrinsic::coro_async_resume, Intrinsic::coro_begin_custom_abi});
+          Intrinsic::coro_async_resume, Intrinsic::coro_begin_custom_abi,
+          Intrinsic::coro_recursion_anchor});
 }
 
 PreservedAnalyses CoroCleanupPass::run(Module &M,

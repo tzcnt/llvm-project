@@ -6,6 +6,7 @@ add_llvm_component_library(LLVMCoroutines
   CoroEarly.cpp
   CoroElide.cpp
   CoroFrame.cpp
+  CoroRecursionPeel.cpp
   CoroSplit.cpp
   SuspendCrossingInfo.cpp
   SpillUtils.cpp

@@ -42,13 +42,30 @@ using namespace llvm;
 // frequency regardless of how many suspend points precede it, and dilution
 // below the threshold reflects genuine branch conditions: profile data, an
 // explicit [[unlikely]] / __builtin_expect annotation (~0.05% of entry), or
-// statically cold paths. The default admits call sites at least ~10% likely
-// to execute per entry into the caller.
+// statically cold paths. The default of 0 disables the frequency gate;
+// pass a positive ratio to reject call sites less likely to execute than
+// that fraction of the caller's entry frequency.
 static cl::opt<float> CoroElideBranchRatio(
-    "coro-elide-branch-ratio", cl::init(0.1), cl::Hidden,
+    "coro-elide-branch-ratio", cl::init(0.0), cl::Hidden,
     cl::desc("Minimum ratio between the frequency of a coro_elide_safe call "
              "site and the entry frequency of its caller for the callee "
              "coroutine to be elided."));
+
+// An elided callee's frame becomes part of the caller's frame, so elision
+// compounds through nested awaits: the callee's frame size at decision time
+// already includes every frame previously elided into it. Without a limit,
+// recursive task trees accrete into a single enormous root frame whose
+// working set far exceeds what heap allocation (with allocator block reuse)
+// would touch. Frames larger than this limit stay heap-allocated. The
+// default was chosen empirically on a fork-join task tree benchmark: caps
+// from 1 KiB to 32 KiB perform equivalently well (beating both unlimited
+// elision and no elision), while larger caps monotonically increase the
+// resident set and converge toward the unlimited-elision slowdown.
+static cl::opt<uint64_t> CoroElideMaxFrameSize(
+    "coro-elide-max-frame-size", cl::init(32768), cl::Hidden,
+    cl::desc("Maximum callee coroutine frame size, in bytes, that may be "
+             "elided into a caller's frame. Larger callee frames remain "
+             "dynamically allocated."));
 extern cl::opt<unsigned> MinBlockCounterExecution;
 
 static Instruction *getFirstNonAllocaInTheEntryBlock(Function *F) {
@@ -163,6 +180,22 @@ PreservedAnalyses CoroAnnotationElidePass::run(LazyCallGraph::SCC &C,
       bool IsCallerPresplitCoroutine = Caller->isPresplitCoroutine();
       bool HasAttr = CB->hasFnAttr(llvm::Attribute::CoroElideSafe);
       if (IsCallerPresplitCoroutine && HasAttr) {
+        if (FrameSize > CoroElideMaxFrameSize) {
+          ORE.emit([&]() {
+            return OptimizationRemarkMissed(
+                       DEBUG_TYPE, "CoroAnnotationElideTooLarge", Caller)
+                   << "'" << ore::NV("callee", Callee->getName())
+                   << "' not elided in '"
+                   << ore::NV("caller", Caller->getName())
+                   << "' because its frame is too large: "
+                   << ore::NV("frame_size", FrameSize) << " (max: "
+                   << ore::NV("max_frame_size",
+                              CoroElideMaxFrameSize.getValue())
+                   << ")";
+          });
+          continue;
+        }
+
         auto &BFI = FAM.getResult<BlockFrequencyAnalysis>(*Caller);
 
         auto BlockFreq = BFI.getBlockFreq(CB->getParent()).getFrequency();

@@ -7,10 +7,14 @@
 ; but downstream of two suspend points, matching the shape of real frontend
 ; output; we expect the `callee` coroutine to be elided.
 ; Inside `caller_conditional_unlikely`, `callee` is only called on a path
-; whose branch weights mark it as very unlikely, hence we expect the `callee`
-; coroutine NOT to be elided.
+; whose branch weights mark it as very unlikely. With the frequency gate
+; enabled (a positive -coro-elide-branch-ratio), we expect the `callee`
+; coroutine NOT to be elided there. The gate is disabled by default
+; (ratio 0, with the frame size limit acting as the elision heuristic
+; instead), so by default even that call site is elided.
 ;
-; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' | FileCheck %s
+; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' -coro-elide-branch-ratio=0.1 | FileCheck %s --check-prefixes=CHECK,RATIO
+; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' | FileCheck %s --check-prefixes=CHECK,DEFAULT
 
 %struct.Task = type { ptr }
 
@@ -177,10 +181,12 @@ entry:
   br i1 %cond, label %call, label %ret, !prof !0
 
 call:
-  ; CHECK-NOT: alloca [32 x i8]
-  ; CHECK-NOT: @llvm.coro.id({{.*}}, ptr @callee, {{.*}})
-  ; CHECK: %task = call ptr @callee(i8 0)
-  ; CHECK-NEXT: br label %ret
+  ; RATIO-NOT: alloca [32 x i8]
+  ; RATIO-NOT: @llvm.coro.id({{.*}}, ptr @callee, {{.*}})
+  ; RATIO: %task = call ptr @callee(i8 0)
+  ; RATIO-NEXT: br label %ret
+  ; DEFAULT: @llvm.coro.id({{.*}}, ptr @callee, {{.*}})
+  ; DEFAULT-NOT: %task = call ptr @callee(i8 0)
   %task = call ptr @callee(i8 0) coro_elide_safe
   br label %ret
 

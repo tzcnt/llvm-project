@@ -56,16 +56,32 @@ static cl::opt<float> CoroElideBranchRatio(
 // already includes every frame previously elided into it. Without a limit,
 // recursive task trees accrete into a single enormous root frame whose
 // working set far exceeds what heap allocation (with allocator block reuse)
-// would touch. Frames larger than this limit stay heap-allocated. The
-// default was chosen empirically on a fork-join task tree benchmark: caps
-// from 1 KiB to 32 KiB perform equivalently well (beating both unlimited
-// elision and no elision), while larger caps monotonically increase the
-// resident set and converge toward the unlimited-elision slowdown.
+// would touch. Callee frames larger than this limit stay heap-allocated.
+// The default was chosen empirically on a fork-join task tree benchmark:
+// performance peaks in the 4-8 KiB range, degrades past 32 KiB, and falls
+// below no-elision-at-all past 128 KiB. Bounding the callee frame size (a
+// complete, temporally compact unit of work) measures better than bounding
+// the caller's accumulated total, which preferentially rejects the later
+// visited (larger, in postorder) children and fragments the task tree into
+// long-lived chains touched at widely separated fork and join times.
 static cl::opt<uint64_t> CoroElideMaxFrameSize(
-    "coro-elide-max-frame-size", cl::init(32768), cl::Hidden,
+    "coro-elide-max-frame-size", cl::init(8192), cl::Hidden,
     cl::desc("Maximum callee coroutine frame size, in bytes, that may be "
              "elided into a caller's frame. Larger callee frames remain "
              "dynamically allocated."));
+
+// The per-callee limit alone still allows a caller with many elidable call
+// sites to accrete (sites x limit) bytes, since each callee is admitted
+// individually. This bounds the total: once the frames already elided into
+// a caller plus the candidate exceed it, further callees stay
+// heap-allocated. It is a backstop for wide fan-out bodies (e.g. a variadic
+// join of dozens of tasks); at 4x the per-callee limit it never binds for
+// fan-outs of four or fewer maximum-size children.
+static cl::opt<uint64_t> CoroElideMaxAccumulatedFrameSize(
+    "coro-elide-max-accumulated-frame-size", cl::init(32768), cl::Hidden,
+    cl::desc("Maximum total size, in bytes, of callee coroutine frames "
+             "elided into any one caller's frame. Callee frames that do not "
+             "fit under this limit remain dynamically allocated."));
 extern cl::opt<unsigned> MinBlockCounterExecution;
 
 static Instruction *getFirstNonAllocaInTheEntryBlock(Function *F) {
@@ -76,7 +92,9 @@ static Instruction *getFirstNonAllocaInTheEntryBlock(Function *F) {
 }
 
 // Create an alloca in the caller, using FrameSize and FrameAlign as the callee
-// coroutine's activation frame.
+// coroutine's activation frame. The alloca is tagged with metadata so later
+// elision decisions can total up the frame bytes already elided into the
+// caller.
 static Value *allocateFrameInCaller(Function *Caller, uint64_t FrameSize,
                                     Align FrameAlign) {
   LLVMContext &C = Caller->getContext();
@@ -86,7 +104,22 @@ static Value *allocateFrameInCaller(Function *Caller, uint64_t FrameSize,
   auto FrameTy = ArrayType::get(Type::getInt8Ty(C), FrameSize);
   auto *Frame = new AllocaInst(FrameTy, DL.getAllocaAddrSpace(), "", InsertPt);
   Frame->setAlignment(FrameAlign);
+  Frame->setMetadata("coro.elided.frame", MDNode::get(C, {}));
   return Frame;
+}
+
+// Total size in bytes of callee coroutine frames already elided into this
+// function. Elided-frame allocas always land in the entry block (both when
+// created here and after InlineFunction hoists them from an inlined callee).
+static uint64_t accumulatedElidedFrameSize(Function *Caller) {
+  uint64_t Sum = 0;
+  const DataLayout &DL = Caller->getDataLayout();
+  for (Instruction &I : Caller->getEntryBlock())
+    if (auto *AI = dyn_cast<AllocaInst>(&I))
+      if (AI->hasMetadata("coro.elided.frame"))
+        if (auto Size = AI->getAllocationSize(DL))
+          Sum += Size->getFixedValue();
+  return Sum;
 }
 
 // Given a call or invoke instruction to the elide safe coroutine, this function
@@ -191,6 +224,26 @@ PreservedAnalyses CoroAnnotationElidePass::run(LazyCallGraph::SCC &C,
                    << ore::NV("frame_size", FrameSize) << " (max: "
                    << ore::NV("max_frame_size",
                               CoroElideMaxFrameSize.getValue())
+                   << ")";
+          });
+          continue;
+        }
+
+        uint64_t AccumFrameSize =
+            accumulatedElidedFrameSize(Caller) + FrameSize;
+        if (AccumFrameSize > CoroElideMaxAccumulatedFrameSize) {
+          ORE.emit([&]() {
+            return OptimizationRemarkMissed(
+                       DEBUG_TYPE, "CoroAnnotationElideTooManyFrames", Caller)
+                   << "'" << ore::NV("callee", Callee->getName())
+                   << "' not elided in '"
+                   << ore::NV("caller", Caller->getName())
+                   << "' because the caller's accumulated elided frame size "
+                      "would be too large: "
+                   << ore::NV("accumulated_frame_size", AccumFrameSize)
+                   << " (max: "
+                   << ore::NV("max_accumulated_frame_size",
+                              CoroElideMaxAccumulatedFrameSize.getValue())
                    << ")";
           });
           continue;

@@ -2,18 +2,25 @@
 ; callee's frame size at decision time already includes every frame
 ; previously elided into the callee. Unlimited elision therefore compounds
 ; through nested awaits: a recursive task tree accretes into a single
-; enormous root frame. To bound this, a `coro_elide_safe` callee whose
-; frame exceeds -coro-elide-max-frame-size stays dynamically allocated no
-; matter how hot the call site is.
+; enormous root frame. Two limits bound this:
+; -coro-elide-max-frame-size rejects any single callee frame larger than
+; the limit, and -coro-elide-max-accumulated-frame-size rejects a callee
+; once the total frame bytes elided into its caller (including the
+; candidate) would exceed the limit. Callees that do not fit stay
+; dynamically allocated no matter how hot the call site is.
 ;
-; @callee_small (32-byte frame) is elided under the default limit;
-; @callee_big (40000-byte frame) is not. Raising the limit admits
-; @callee_big; lowering it below 32 rejects @callee_small too.
+; @callee_small (32-byte frame) is elided under the default limits;
+; @callee_big (40000-byte frame) is not. Raising the limits admits
+; @callee_big; lowering the per-callee limit below 32 rejects @callee_small
+; too. @caller_twice awaits @callee_big twice: with both limits at 65536
+; only one of the two 40000-byte frames fits under the accumulated limit,
+; so exactly one call site is elided.
 ;
 ; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' | FileCheck %s --check-prefixes=CHECK,DEFAULT
-; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' -coro-elide-max-frame-size=65536 | FileCheck %s --check-prefixes=CHECK,BIGCAP
+; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' -coro-elide-max-frame-size=65536 -coro-elide-max-accumulated-frame-size=65536 | FileCheck %s --check-prefixes=CHECK,BIGCAP
 ; RUN: opt < %s -S -passes='cgscc(coro-annotation-elide)' -coro-elide-max-frame-size=16 | FileCheck %s --check-prefixes=CHECK,TINYCAP
 ; RUN: opt < %s -passes='cgscc(coro-annotation-elide)' -pass-remarks-missed=coro-annotation-elide -S -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+; RUN: opt < %s -passes='cgscc(coro-annotation-elide)' -coro-elide-max-frame-size=65536 -coro-elide-max-accumulated-frame-size=65536 -pass-remarks-missed=coro-annotation-elide -S -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK2
 
 %struct.Task = type { ptr }
 
@@ -121,7 +128,26 @@ entry:
   ret ptr %task
 }
 
-; REMARK: 'callee_big' not elided in 'caller_big' because its frame is too large: 40000 (max: 32768)
+; Two elidable awaits of the same large callee: the limit applies to the
+; caller's accumulated elided frame bytes, so under BIGCAP (65536) only one
+; of the two 40000-byte frames fits and exactly one call site is elided.
+; CHECK-LABEL: define ptr @caller_twice()
+define ptr @caller_twice() #0 {
+entry:
+  ; DEFAULT-NOT: alloca [40000 x i8]
+  ; DEFAULT: call ptr @callee_big(i8
+  ; BIGCAP: alloca [40000 x i8], align 8
+  ; BIGCAP-NOT: alloca [40000 x i8]
+  ; BIGCAP: call ptr @callee_big(i8
+  ; TINYCAP-NOT: alloca [40000 x i8]
+  ; TINYCAP: call ptr @callee_big(i8
+  %task1 = call ptr @callee_big(i8 0) coro_elide_safe
+  %task2 = call ptr @callee_big(i8 1) coro_elide_safe
+  ret ptr %task2
+}
+
+; REMARK: 'callee_big' not elided in 'caller_big' because its frame is too large: 40000 (max: 8192)
+; REMARK2: 'callee_big' not elided in 'caller_twice' because the caller's accumulated elided frame size would be too large: 80000 (max: 65536)
 
 declare token @llvm.coro.id(i32, ptr, ptr, ptr)
 declare ptr @llvm.coro.begin(token, ptr)

@@ -1412,6 +1412,14 @@ def CoroAwaitElidableArgument : InheritableAttr {
   let SimpleHandler = 1;
 }
 
+def CoroAwaitElidableRange : InheritableAttr {
+  let Spellings = [Clang<"coro_await_elidable_range">];
+  let Subjects = SubjectList<[CXXRecord]>;
+  let LangOpts = [CPlusPlus];
+  let Documentation = [CoroAwaitElidableRangeDoc];
+  let SimpleHandler = 1;
+}
+
 // OSObject-based attributes.
 def OSConsumed : InheritableParamAttr {
   let Spellings = [Clang<"os_consumed">];

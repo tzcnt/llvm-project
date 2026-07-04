@@ -13,6 +13,8 @@
 #include "CGCleanup.h"
 #include "CGDebugInfo.h"
 #include "CodeGenFunction.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/IgnoreExpr.h"
 #include "clang/AST/StmtCXX.h"
 #include "clang/AST/StmtVisitor.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -296,6 +298,24 @@ static LValueOrRValue emitSuspendExpression(CodeGenFunction &CGF, CGCoroData &Co
                                              SuspendIntrinsicCallArgs);
 
   assert(SuspendRet);
+
+  // If the awaited operand is an elide-safe prvalue call of a type marked
+  // [[clang::coro_await_elidable_range]], tag the await-suspend intrinsic
+  // call. The coroutine passes locate the awaiter object through this call's
+  // first operand and may elide the frames of the coroutines linked to it
+  // (bulk spawn sites whose tasks are consumed from an iterator or range and
+  // are therefore invisible to the argument-based elide-safe marking).
+  if (Kind == AwaitKind::Normal) {
+    if (auto *OperandCall = dyn_cast<CallExpr>(IgnoreExprNodes(
+            S.getOperand(), IgnoreImplicitSingleStep, IgnoreParensSingleStep));
+        OperandCall && OperandCall->isCoroElideSafe()) {
+      auto *Record = OperandCall->getType()->getAsCXXRecordDecl();
+      if (Record && Record->hasAttr<CoroAwaitElidableRangeAttr>())
+        SuspendRet->addFnAttr(
+            llvm::Attribute::get(CGF.getLLVMContext(), "coro-elide-range"));
+    }
+  }
+
   CGF.CurCoro.InSuspendBlock = false;
 
   switch (SuspendReturnType) {

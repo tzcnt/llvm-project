@@ -52,6 +52,11 @@ struct LowererBase {
 };
 
 bool defaultMaterializable(Instruction &V);
+/// True if CB is the llvm.coro.await.suspend.* call of a bulk awaitable
+/// whose direct await the frontend marked elide-safe ("coro-elide-range").
+/// The coroutines such an awaitable runs and joins are candidates for frame
+/// elision into the awaiting coroutine (see CoroRecursiveElide).
+bool isRangeMarkedAwaitSuspend(const CallBase &CB);
 void normalizeCoroutine(Function &F, coro::Shape &Shape,
                         TargetTransformInfo &TTI);
 /// Split a single presplit coroutine outside the CGSCC pipeline. Performs no

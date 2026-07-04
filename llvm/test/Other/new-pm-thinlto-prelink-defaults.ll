@@ -58,6 +58,7 @@
 ; CHECK-O-NODIS-NEXT: Running analysis: InnerAnalysisManagerProxy
 ; CHECK-O-NEXT: Running analysis: TargetLibraryAnalysis
 ; CHECK-O-NEXT: Running pass: CoroEarlyPass
+; CHECK-O-NEXT: Running pass: CoroRecursionStashPass
 ; CHECK-O-NEXT: Running pass: EntryExitInstrumenterPass
 ; CHECK-O-NEXT: Running pass: LowerExpectIntrinsicPass
 ; CHECK-O-NEXT: Running pass: SimplifyCFGPass
@@ -177,6 +178,7 @@
 ; CHECK-O-NEXT: Invalidating analysis: ShouldNotRunFunctionPassesAnalysis
 ; CHECK-O-NEXT: Invalidating analysis: InlineAdvisorAnalysis
 ; CHECK-O-NEXT: Running pass: DeadArgumentEliminationPass
+; CHECK-O-NEXT: Running pass: CoroRecursiveElidePass
 ; CHECK-O-NEXT: Running pass: GlobalOptPass
 ; CHECK-O-NEXT: Running pass: GlobalDCEPass
 ; CHECK-EXT: Running pass: {{.*}}::Bye

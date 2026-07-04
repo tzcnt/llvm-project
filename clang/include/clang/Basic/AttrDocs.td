@@ -9880,6 +9880,35 @@ Example:
 }];
 }
 
+def CoroAwaitElidableRangeDoc : Documentation {
+  let Category = DocCatDecl;
+  let Content = [{
+
+The ``[[clang::coro_await_elidable_range]]`` is a class attribute which can be
+applied to a bulk-spawn awaitable: a coroutine return type whose awaiter, when
+directly ``co_await``\ ed as a prvalue, launches a *set* of coroutines that are
+not syntactically visible as arguments (for example, coroutines consumed from
+an iterator or range) and guarantees, like ``[[clang::coro_await_elidable]]``,
+that every one of those coroutines completes before the ``co_await``
+expression resumes.
+
+By attaching this attribute, the user asserts structured concurrency for the
+whole set: any coroutine whose promise is linked to the awaiter object before
+the suspend (identified in the IR by stores of pointers into the awaiter
+through the coroutine's handle) has a lifetime strictly contained in the
+current activation of the awaiting coroutine. The compiler may then allocate
+the frames of such coroutines inside the awaiting coroutine's frame — one slot
+per creation when the number of creations is statically bounded — instead of
+on the heap.
+
+Unlike ``[[clang::coro_await_elidable]]``, which propagates elision safety to
+prvalue arguments through ``[[clang::coro_await_elidable_argument]]``
+parameters, this attribute covers coroutines that reach the awaitable through
+runtime iteration, where no argument chain exists.
+
+}];
+}
+
 def CountedByDocs : Documentation {
   let Category = DocCatField;
   let Content = [{

@@ -849,6 +849,11 @@ static bool isAttributedCoroAwaitElidable(const QualType &QT) {
   return Record && Record->hasAttr<CoroAwaitElidableAttr>();
 }
 
+static bool isAttributedCoroAwaitElidableRange(const QualType &QT) {
+  auto *Record = QT->getAsCXXRecordDecl();
+  return Record && Record->hasAttr<CoroAwaitElidableRangeAttr>();
+}
+
 static void applySafeElideContext(Expr *Operand) {
   // Strip both implicit nodes and parentheses to find the underlying CallExpr.
   // The AST may have these in either order, so we apply both transformations
@@ -858,7 +863,8 @@ static void applySafeElideContext(Expr *Operand) {
   if (!Call || !Call->isPRValue())
     return;
 
-  if (!isAttributedCoroAwaitElidable(Call->getType()))
+  if (!isAttributedCoroAwaitElidable(Call->getType()) &&
+      !isAttributedCoroAwaitElidableRange(Call->getType()))
     return;
 
   Call->setCoroElideSafe();

@@ -1987,6 +1987,19 @@ static bool hasSafeElideCaller(Function &F) {
   return false;
 }
 
+// A coroutine that itself awaits a range-marked bulk awaitable is, on a
+// recursion cycle, also a candidate child of that awaitable's creation
+// sites. Those sites carry no attribute (they are recovered from the IR by
+// CoroRecursiveElide's bulk range elision, after this split), so the
+// `.noalloc` variant must be created for the generations to consume.
+static bool hasRangeMarkedAwait(Function &F) {
+  for (Instruction &I : instructions(F))
+    if (auto *CB = dyn_cast<CallBase>(&I))
+      if (coro::isRangeMarkedAwaitSuspend(*CB))
+        return true;
+  return false;
+}
+
 void coro::SwitchABI::splitCoroutine(Function &F, coro::Shape &Shape,
                                      SmallVectorImpl<Function *> &Clones,
                                      TargetTransformInfo &TTI) {
@@ -2001,6 +2014,10 @@ static void doSplitCoroutine(Function &F, SmallVectorImpl<Function *> &Clones,
   auto &Shape = ABI.Shape;
   assert(Shape.CoroBegin);
 
+  // Checked before the await.suspend calls (and their markings) are lowered
+  // away.
+  bool HasRangeMarkedAwait = hasRangeMarkedAwait(F);
+
   lowerAwaitSuspends(F, Shape);
 
   simplifySuspendPoints(Shape);
@@ -2013,7 +2030,7 @@ static void doSplitCoroutine(Function &F, SmallVectorImpl<Function *> &Clones,
 
   bool shouldCreateNoAllocVariant =
       !isNoSuspendCoroutine && Shape.ABI == coro::ABI::Switch &&
-      (hasSafeElideCaller(F) || ForceNoAllocVariant) &&
+      (hasSafeElideCaller(F) || HasRangeMarkedAwait || ForceNoAllocVariant) &&
       !F.hasFnAttribute(llvm::Attribute::NoInline);
 
   // If there are no suspend points, no split required, just remove

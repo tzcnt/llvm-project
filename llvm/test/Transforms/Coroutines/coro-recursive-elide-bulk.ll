@@ -7,13 +7,15 @@
 ; and joins).
 ;
 ; @f creates one child in straight-line code (one slot, direct rewrite) and
-; four children in a loop with a computable trip bound (four slots selected
-; by a synthesized counter, direct rewrite). @g's loop has no computable
-; bound: it gets the default number of slots and a guarded dispatch whose
-; fallback keeps calling the runtime-allocating published symbol.
+; four children in a loop with a computable trip bound: the bound wins over
+; the smaller default slot count (the array is sized exactly to it) and the
+; slots are selected by a synthesized counter with no runtime guard. @g's
+; loop has no computable bound: it gets the default number of slots and a
+; guarded dispatch whose fallback keeps calling the runtime-allocating
+; published symbol.
 ;
 ; RUN: opt < %s -S -passes='coro-recursion-stash' | FileCheck %s --check-prefix=STASH
-; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=100000 -coro-elide-max-accumulated-frame-size=400000 -coro-recursive-elide-max-generations=1 -coro-elide-bulk-default-slots=8 | FileCheck %s
+; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=100000 -coro-elide-max-accumulated-frame-size=400000 -coro-recursive-elide-max-generations=1 -coro-elide-bulk-default-slots=2 | FileCheck %s
 ;
 ; A loop site whose slot target does not fit the remaining accumulated
 ; budget abandons the generation entirely (no partially elided blocks).
@@ -41,6 +43,7 @@
 ; artifact names).
 ; CHECK: store ptr @f.resume
 ; CHECK-NOT: call ptr @f.block.0(
+; CHECK-NOT: select i1 %{{.*}}, ptr %{{.*}}, ptr null
 
 define ptr @f(i64 %n) #0 {
 entry:
@@ -102,7 +105,7 @@ define ptr @f.wrap(ptr %awaiter, ptr %frame) {
 ; The loop bound is a runtime value: the site gets the default slot count
 ; behind a guard, and executions past the last slot call the published @g.
 ; CHECK-LABEL: define ptr @g(i64 %n)
-; CHECK: icmp ult i64 %{{.*}}, 8
+; CHECK: icmp ult i64 %{{.*}}, 2
 ; CHECK: select i1 %{{.*}}, ptr %{{.*}}, ptr null
 ; CHECK: store ptr @g.resume
 ; CHECK: call ptr @g(i64 %{{.*}})

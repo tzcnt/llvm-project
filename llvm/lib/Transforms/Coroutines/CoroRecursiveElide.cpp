@@ -730,20 +730,26 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
         if (Callee.FrameSize > CoroElideMaxFrameSize)
           continue;
         uint64_t Padded = alignTo(Callee.FrameSize, Callee.FrameAlign);
-        // Slot target: the known execution bound, capped by the default
-        // (executions past the reserved slots take the runtime fallback,
-        // so the cap trades block size against fallback allocations; on
-        // jagged trees most activations use far fewer slots than the
-        // worst-case bound). A site whose target does not fit the
-        // remaining accumulated budget makes the generation partial.
-        uint64_t Target = !BS.L ? 1
-                                : std::min(BS.KnownBound ? BS.KnownBound
-                                                         : UINT64_MAX,
-                                           CoroBulkDefaultSlots.getValue());
         uint64_t Accum = accumulatedElidedFrameSize(G);
         // Division form; immune to overflow on absurd trip bounds.
-        if (Accum >= CoroElideMaxAccumulatedFrameSize ||
-            Target > (CoroElideMaxAccumulatedFrameSize - Accum) / Padded) {
+        uint64_t BudgetSlots =
+            Accum >= CoroElideMaxAccumulatedFrameSize
+                ? 0
+                : (CoroElideMaxAccumulatedFrameSize - Accum) / Padded;
+        // Slot target: a site with a known execution bound that fits the
+        // remaining accumulated budget is sized exactly to it and needs no
+        // runtime guard. Sites with unknown (or over-budget) bounds get
+        // the guarded default: executions past the reserved slots allocate
+        // through the published symbol instead. A site that cannot even
+        // fit that makes the generation partial.
+        uint64_t Target;
+        if (!BS.L)
+          Target = 1;
+        else if (BS.KnownBound && BS.KnownBound <= BudgetSlots)
+          Target = BS.KnownBound;
+        else
+          Target = CoroBulkDefaultSlots;
+        if (Target > BudgetSlots) {
           Partial = true;
           continue;
         }

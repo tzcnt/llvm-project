@@ -6,20 +6,23 @@
 ; handle (the linking a bulk awaitable performs on each coroutine it runs
 ; and joins).
 ;
-; @f creates one child in straight-line code (one slot, direct rewrite) and
-; four children in a loop with a computable trip bound: the bound wins over
-; the smaller default slot count (the array is sized exactly to it) and the
-; slots are selected by a synthesized counter with no runtime guard. @g's
-; loop has no computable bound: it gets the default number of slots and a
-; guarded dispatch whose fallback keeps calling the runtime-allocating
-; published symbol.
+; @f creates one child in straight-line code (one in-frame slot, direct
+; rewrite) and four children in a self-recursive loop: the loop site gets a
+; per-activation heap arena, ensured in the preheader (the trip count is
+; computable there), whose slots hold this same generation's `.noalloc`
+; frames -- the creation is rewritten to a guarded dispatch between that
+; `.noalloc` and the published symbol. @g's loop bound is a runtime value:
+; the same arena form, sized by the expanded count.
 ;
 ; RUN: opt < %s -S -passes='coro-recursion-stash' | FileCheck %s --check-prefix=STASH
 ; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=100000 -coro-elide-max-accumulated-frame-size=400000 -coro-recursive-elide-max-generations=1 -coro-elide-bulk-default-slots=2 | FileCheck %s
 ;
-; A loop site whose slot target does not fit the remaining accumulated
-; budget abandons the generation entirely (no partially elided blocks).
-; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-accumulated-frame-size=48 -coro-recursive-elide-max-generations=1 | FileCheck %s --check-prefix=PARTIAL
+; With the arena rejected (threshold zero), a self-recursive loop site is
+; skipped outright -- in-frame slots would charge every activation for the
+; worst case -- and a straight-line site whose slot does not fit the
+; remaining accumulated budget abandons the generation entirely: no
+; partially elided blocks anywhere.
+; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-accumulated-frame-size=48 -coro-elide-bulk-arena-max-frame-size=0 -coro-recursive-elide-max-generations=1 | FileCheck %s --check-prefix=PARTIAL
 
 ; The stash accepts an SCC whose qualifying evidence is a range-marked bulk
 ; await (no coro_elide_safe cycle site exists here), and the template keeps
@@ -30,20 +33,24 @@
 
 ; PARTIAL-NOT: .block.
 
-; After the full pipeline, the republished @f embeds five child frames: the
-; straight-line child and four loop children indexed by a counter.
+; After the full pipeline, the republished @f embeds the straight-line
+; child's frame and gives the loop children a per-activation arena.
 ; CHECK-LABEL: define ptr @f(i64 %n)
-; The straight-line child's frame is the array itself; the loop children
-; select their slot by counter * padded-frame-size.
-; CHECK: phi i64
-; CHECK: mul nuw i64
-; CHECK: getelementptr i8, ptr
-; The elided creations initialize the child frames in place with the
-; original split's resume pointer (generation 0 keeps the original's split
-; artifact names).
+; The straight-line child is initialized in place with generation 0's
+; resume pointer (its `.noalloc` was inlined; generation 0 keeps the
+; original's artifact names).
 ; CHECK: store ptr @f.resume
+; The arena is ensured in the preheader, sized count x padded-frame-size
+; (the count folded to 4, clamped and floored by the slot knobs).
+; CHECK: call i64 @llvm.umin.i64(i64 4,
+; CHECK: call i64 @llvm.umax.i64(
+; CHECK: call ptr @malloc(
+; The loop children select an arena slot by counter * padded size and call
+; this generation's own `.noalloc`, which stays outlined.
+; CHECK: mul nuw i64
+; CHECK: select i1 %{{.*}}, ptr %{{.*}}, ptr null
+; CHECK: call ptr @f.block.1.noalloc(i64 %{{.*}}, ptr %{{.*}})
 ; CHECK-NOT: call ptr @f.block.0(
-; CHECK-NOT: select i1 %{{.*}}, ptr %{{.*}}, ptr null
 
 define ptr @f(i64 %n) #0 {
 entry:
@@ -102,12 +109,16 @@ define ptr @f.wrap(ptr %awaiter, ptr %frame) {
   ret ptr %frame
 }
 
-; The loop bound is a runtime value: the site gets the default slot count
-; behind a guard, and executions past the last slot call the published @g.
+; The loop bound is a runtime value: the arena is sized by the expanded
+; trip count (clamped to the slot maximum, floored by the default target),
+; and executions past the reserved slots -- or with the allocation failed
+; -- fall back to the published @g.
 ; CHECK-LABEL: define ptr @g(i64 %n)
-; CHECK: icmp ult i64 %{{.*}}, 2
+; CHECK: call i64 @llvm.umin.i64(
+; CHECK: call i64 @llvm.umax.i64(
+; CHECK: call ptr @malloc(
 ; CHECK: select i1 %{{.*}}, ptr %{{.*}}, ptr null
-; CHECK: store ptr @g.resume
+; CHECK: call ptr @g.block.1.noalloc(i64 %{{.*}}, ptr %{{.*}})
 ; CHECK: call ptr @g(i64 %{{.*}})
 ; The dispatch helper is consumed by inlining (only its name survives in
 ; inherited basic block labels).

@@ -82,6 +82,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -90,8 +91,11 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Coroutines/CoroInstr.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
 using namespace llvm;
@@ -115,6 +119,27 @@ static cl::opt<uint64_t> CoroBulkDefaultSlots(
              "site; executions beyond the reserved slots allocate "
              "normally. Bounds the speculative block size on sites with "
              "large or unknown execution counts."));
+
+static cl::opt<uint64_t> CoroBulkMaxArenaSlots(
+    "coro-elide-bulk-max-arena-slots", cl::init(1024), cl::Hidden,
+    cl::desc("Maximum frame slots one per-activation arena may hold for a "
+             "self-recursive bulk range site; executions beyond it "
+             "allocate normally."));
+
+static cl::opt<bool> CoroBulkArenaLineAlign(
+    "coro-elide-bulk-arena-line-align", cl::init(false), cl::Hidden,
+    cl::desc("Pack per-activation arena slots at whole cache lines "
+             "(aligned_alloc + line-rounded slot pitch) so concurrently "
+             "running sibling frames never share a line, at the cost of "
+             "padding bytes and the allocator's aligned path."));
+
+static cl::opt<uint64_t> CoroBulkArenaMaxFrameSize(
+    "coro-elide-bulk-arena-max-frame-size", cl::init(256), cl::Hidden,
+    cl::desc("Only arena-elide self-recursive bulk range sites whose "
+             "child frame is at most this size. Larger frames recycle "
+             "better individually through a caching allocator than "
+             "batched into multi-KB arenas (measured: 176-byte frames "
+             "win, 360+ lose), so oversized sites are left unelided."));
 
 // Prints the bulk range site discovery decisions; usable in builds without
 // assertions, unlike -debug-only.
@@ -233,6 +258,18 @@ struct BulkRangeSite {
   uint64_t KnownBound = 1;
   // Number of frame slots to reserve; decided by the cost model.
   uint64_t NSlots = 1;
+  // Self-recursive loop site: child frames come from a lazily allocated,
+  // runtime-sized heap arena instead of in-frame slots, and the children
+  // call this very generation's `.noalloc` variant (see elideArenaSite).
+  bool SelfArena = false;
+  // Self-recursive loop site that must not be elided at all: the arena
+  // trade was rejected (frame too large), and in-frame slots for such
+  // sites charge every activation for the worst case.
+  bool Skipped = false;
+  // The site's execution count per loop entry as an i64 materialized in the
+  // loop preheader, when SCEV can both compute and safely expand it there;
+  // null otherwise. Used to size the arena exactly.
+  Value *TripCount = nullptr;
 };
 } // namespace
 
@@ -325,6 +362,88 @@ static void findBulkRangeSites(Function &F, LoopInfo &LI, ScalarEvolution &SE,
   }
 }
 
+// Rewrite one creation call to a small dispatch helper taking the selected
+// slot: a null slot keeps calling the original, runtime-allocating symbol;
+// a non-null one calls the `.noalloc` variant with the slot as its frame.
+// The helper is inlined immediately (building the dispatch as a function
+// lets InlineFunction do the control-flow surgery, which keeps invoke
+// sites and their landing pads intact), and its `.noalloc` arm after it,
+// unless that arm is a self-referential declaration whose body only exists
+// once this very caller is split -- that call is a plain recursive call
+// and stays outlined.
+static void rewriteToGuardedDispatch(CallBase *C, Value *SlotOrNull,
+                                     Function *NoAllocCallee) {
+  Function *Original = C->getCalledFunction();
+  LLVMContext &Ctx = C->getContext();
+  Module *M = C->getModule();
+  auto *HelperTy = NoAllocCallee->getFunctionType();
+  Function *Helper =
+      Function::Create(HelperTy, GlobalValue::InternalLinkage,
+                       Original->getName() + ".bulk.dispatch", M);
+  Helper->setCallingConv(C->getCallingConv());
+  Argument *SlotArg = Helper->getArg(Helper->arg_size() - 1);
+  SmallVector<Value *, 8> FwdArgs;
+  for (unsigned ArgI = 0, E = Helper->arg_size() - 1; ArgI != E; ++ArgI)
+    FwdArgs.push_back(Helper->getArg(ArgI));
+
+  auto *EntryBB = BasicBlock::Create(Ctx, "entry", Helper);
+  auto *ElideBB = BasicBlock::Create(Ctx, "elide", Helper);
+  auto *HeapBB = BasicBlock::Create(Ctx, "heap", Helper);
+  auto *IsNull =
+      new ICmpInst(EntryBB, ICmpInst::ICMP_EQ, SlotArg,
+                   ConstantPointerNull::get(PointerType::get(Ctx, 0)));
+  CondBrInst::Create(IsNull, HeapBB, ElideBB, EntryBB);
+
+  SmallVector<Value *, 8> ElideArgs(FwdArgs);
+  ElideArgs.push_back(SlotArg);
+  auto *ElideCall =
+      CallInst::Create(NoAllocCallee->getFunctionType(), NoAllocCallee,
+                       ElideArgs, "", ElideBB);
+  ElideCall->setCallingConv(NoAllocCallee->getCallingConv());
+  ReturnInst::Create(Ctx, ElideCall, ElideBB);
+
+  auto *HeapCall = CallInst::Create(Original->getFunctionType(), Original,
+                                    FwdArgs, "", HeapBB);
+  HeapCall->setCallingConv(C->getCallingConv());
+  // The escape leg must stay an outlined call to the published symbol.
+  HeapCall->addFnAttr(llvm::Attribute::NoInline);
+  ReturnInst::Create(Ctx, HeapCall, HeapBB);
+
+  // Rewrite the creation call to the helper and fold everything in place:
+  // first the helper into the caller, then the `.noalloc` arm it carried.
+  SmallVector<Value *, 8> NewArgs(C->args());
+  NewArgs.push_back(SlotOrNull);
+  CallBase *NewCB = nullptr;
+  if (isa<CallInst>(C)) {
+    NewCB = CallInst::Create(HelperTy, Helper, NewArgs, "", C->getIterator());
+  } else {
+    auto *II = cast<InvokeInst>(C);
+    NewCB = InvokeInst::Create(HelperTy, Helper, II->getNormalDest(),
+                               II->getUnwindDest(), NewArgs, {}, "",
+                               C->getIterator());
+  }
+  NewCB->setCallingConv(Helper->getCallingConv());
+  NewCB->setDebugLoc(C->getDebugLoc());
+  C->replaceAllUsesWith(NewCB);
+  C->eraseFromParent();
+
+  InlineFunctionInfo IFI;
+  if (!InlineFunction(*NewCB, IFI).isSuccess()) {
+    // Leave the outlined helper behind; it is correct, merely not folded.
+    return;
+  }
+  Helper->eraseFromParent();
+  if (NoAllocCallee->isDeclaration())
+    return;
+  for (CallBase *Inlined : IFI.InlinedCallSites) {
+    if (Inlined->getCalledFunction() == NoAllocCallee) {
+      InlineFunctionInfo NestedIFI;
+      InlineFunction(*Inlined, NestedIFI);
+      break;
+    }
+  }
+}
+
 // Elide one bulk range site: allocate an array of NSlots callee frames in
 // the caller and synthesize a counter selecting the next slot on each
 // execution of the creation call. Within one activation every concurrently
@@ -386,72 +505,327 @@ static void elideBulkSite(const BulkRangeSite &Site, Function *Caller,
   Value *SlotOrNull = SelectInst::Create(
       Cmp, Slot, ConstantPointerNull::get(PointerType::get(Ctx, 0)), "",
       C->getIterator());
+  rewriteToGuardedDispatch(C, SlotOrNull, NoAllocCallee);
+}
 
-  // The dispatch helper: (args..., slot) -> slot ? noalloc(args..., slot)
-  //                                             : original(args...)
-  Function *Original = C->getCalledFunction();
-  Module *M = Caller->getParent();
-  auto *HelperTy = NoAllocCallee->getFunctionType();
-  Function *Helper =
-      Function::Create(HelperTy, GlobalValue::InternalLinkage,
-                       Original->getName() + ".bulk.dispatch", M);
-  Argument *SlotArg = Helper->getArg(Helper->arg_size() - 1);
-  SmallVector<Value *, 8> FwdArgs;
-  for (unsigned ArgI = 0, E = Helper->arg_size() - 1; ArgI != E; ++ArgI)
-    FwdArgs.push_back(Helper->getArg(ArgI));
+//===----------------------------------------------------------------------===//
+// Self-recursive bulk range sites: per-activation frame arenas
+//
+// In-frame slot arrays charge every activation of the block for the site's
+// worst-case fan-out. On jagged trees most activations are leaves that use
+// no slots at all, and nesting a second generation multiplies the dead
+// space again: measured on UTS (geometric tree, ~80% leaves), the blocks
+// grew to 58x the plain frame while the allocation count barely halved,
+// because slot children run generation-0 code whose own children re-enter
+// the published block symbol (only alternating levels elide).
+//
+// When the creation call targets the recursion member itself, both
+// problems disappear at once by moving the slots out of the frame into a
+// per-activation heap arena, and pointing the children at this very
+// generation's `.noalloc` variant:
+//
+//  - The frame carries only an arena pointer (plus a capacity when the
+//    size is dynamic); activations that never create a child never
+//    allocate an arena. The arena is sized exactly when SCEV can
+//    materialize the creation loop's trip count in the preheader, and is
+//    freed at frame teardown -- re-entries of the loop (batched joins)
+//    reuse it.
+//
+//  - Because the children run the same generation, every level of the
+//    recursion elides: each activation lives in its parent's arena and
+//    allocates exactly one arena for all of its own children. One
+//    generation therefore covers the whole recursion, replacing the
+//    N-frames-per-block geometric growth (and the generation ladder) with
+//    one exact-sized allocation per internal node.
+//
+// The slot size is the generation's own final frame size, which does not
+// exist while the generation is still presplit; llvm.coro.size/align stand
+// in for it and are folded by CoroSplit when the generation is split. For
+// the same reason the children call a placeholder declaration
+// `<gen>.noalloc.self` that is RAUW'd to the real `.noalloc` right after
+// the split.
+//===----------------------------------------------------------------------===//
 
-  auto *EntryBB = BasicBlock::Create(Ctx, "entry", Helper);
-  auto *ElideBB = BasicBlock::Create(Ctx, "elide", Helper);
-  auto *HeapBB = BasicBlock::Create(Ctx, "heap", Helper);
-  auto *IsNull =
-      new ICmpInst(EntryBB, ICmpInst::ICMP_EQ, SlotArg,
-                   ConstantPointerNull::get(PointerType::get(Ctx, 0)));
-  CondBrInst::Create(IsNull, HeapBB, ElideBB, EntryBB);
-
-  SmallVector<Value *, 8> ElideArgs(FwdArgs);
-  ElideArgs.push_back(SlotArg);
-  auto *ElideCall =
-      CallInst::Create(NoAllocCallee->getFunctionType(), NoAllocCallee,
-                       ElideArgs, "", ElideBB);
-  ReturnInst::Create(Ctx, ElideCall, ElideBB);
-
-  auto *HeapCall = CallInst::Create(Original->getFunctionType(), Original,
-                                    FwdArgs, "", HeapBB);
-  // The escape leg must stay an outlined call to the published symbol.
-  HeapCall->addFnAttr(llvm::Attribute::NoInline);
-  ReturnInst::Create(Ctx, HeapCall, HeapBB);
-
-  // Rewrite the creation call to the helper and fold everything in place:
-  // first the helper into the caller, then the `.noalloc` arm it carried.
-  SmallVector<Value *, 8> NewArgs(C->args());
-  NewArgs.push_back(SlotOrNull);
-  CallBase *NewCB = nullptr;
-  if (isa<CallInst>(C)) {
-    NewCB = CallInst::Create(HelperTy, Helper, NewArgs, "", C->getIterator());
-  } else {
-    auto *II = cast<InvokeInst>(C);
-    NewCB = InvokeInst::Create(HelperTy, Helper, II->getNormalDest(),
-                               II->getUnwindDest(), NewArgs, {}, "",
-                               C->getIterator());
+// Materialize the number of executions of a bulk site's creation call per
+// loop entry as an i64 in the loop preheader, if SCEV can compute and
+// safely expand it there. The value may overestimate by one on loops that
+// exit before the creation block in their final iteration; the in-bounds
+// guard makes any estimate safe, so precision only affects arena sizing.
+static Value *materializeArenaTripCount(Loop *L, ScalarEvolution &SE) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  if (!Preheader) {
+    if (CoroBulkDebug)
+      errs() << "[bulk]     count: no preheader\n";
+    return nullptr;
   }
-  NewCB->setCallingConv(C->getCallingConv());
-  NewCB->setDebugLoc(C->getDebugLoc());
-  C->replaceAllUsesWith(NewCB);
-  C->eraseFromParent();
-
-  InlineFunctionInfo IFI;
-  if (!InlineFunction(*NewCB, IFI).isSuccess()) {
-    // Leave the outlined helper behind; it is correct, merely not folded.
-    return;
-  }
-  Helper->eraseFromParent();
-  for (CallBase *Inlined : IFI.InlinedCallSites) {
-    if (Inlined->getCalledFunction() == NoAllocCallee) {
-      InlineFunctionInfo NestedIFI;
-      InlineFunction(*Inlined, NestedIFI);
-      break;
+  const SCEV *BTC = SE.getBackedgeTakenCount(L);
+  if (isa<SCEVCouldNotCompute>(BTC)) {
+    // Exceptional exits (invoke unwind edges) make the exact count
+    // formally uncomputable even when every normal exit is counted; the
+    // symbolic maximum is still a tight bound on the creations performed,
+    // since an exception only cuts the loop short. An uncounted *normal*
+    // exit (e.g. a filtering iterator's != end) instead means the real
+    // count typically runs far below any structural bound: give up, so
+    // the site takes the clamped default reservation.
+    SmallVector<BasicBlock *, 4> Exiting;
+    L->getExitingBlocks(Exiting);
+    for (BasicBlock *EB : Exiting) {
+      if (!isa<SCEVCouldNotCompute>(SE.getExitCount(L, EB)))
+        continue;
+      auto *II = dyn_cast<InvokeInst>(EB->getTerminator());
+      bool Exceptional = II && !L->contains(II->getUnwindDest()) &&
+                         L->contains(II->getNormalDest());
+      if (!Exceptional) {
+        if (CoroBulkDebug)
+          errs() << "[bulk]     count: normal exit without a count\n";
+        return nullptr;
+      }
+    }
+    BTC = SE.getSymbolicMaxBackedgeTakenCount(L);
+    if (isa<SCEVCouldNotCompute>(BTC)) {
+      if (CoroBulkDebug)
+        errs() << "[bulk]     count: backedge count not computable\n";
+      return nullptr;
     }
   }
+  Type *I64 = Type::getInt64Ty(L->getHeader()->getContext());
+  if (SE.getTypeSizeInBits(BTC->getType()) > 64)
+    return nullptr;
+  const SCEV *Count =
+      SE.getAddExpr(SE.getNoopOrZeroExtend(BTC, I64), SE.getOne(I64));
+  SCEVExpander Expander(SE, "coro.arena");
+  if (!Expander.isSafeToExpandAt(Count, Preheader->getTerminator())) {
+    if (CoroBulkDebug)
+      errs() << "[bulk]     count: not expandable at preheader: " << *Count
+             << "\n";
+    return nullptr;
+  }
+  return Expander.expandCodeFor(Count, I64, Preheader->getTerminator());
+}
+
+// The placeholder declaration for a generation's own `.noalloc` variant,
+// which cannot exist before the generation is split. Signature and calling
+// convention mirror what CoroSplit's createNoAllocVariant will build.
+static Function *getOrCreateSelfNoAllocDecl(Function *G) {
+  Module *M = G->getParent();
+  std::string Name = (G->getName() + ".noalloc.self").str();
+  if (Function *Existing = M->getFunction(Name))
+    return Existing;
+  SmallVector<Type *, 8> Params(G->getFunctionType()->params());
+  Params.push_back(PointerType::getUnqual(G->getContext()));
+  auto *FnTy = FunctionType::get(G->getReturnType(), Params,
+                                 G->getFunctionType()->isVarArg());
+  Function *Decl = Function::Create(FnTy, GlobalValue::ExternalLinkage,
+                                    G->getAddressSpace(), Name, M);
+  Decl->setCallingConv(G->getCallingConv());
+  return Decl;
+}
+
+// Elide one self-recursive bulk range site with a per-activation arena
+// (see the file section comment above). Returns false, leaving the site
+// untouched, if the caller has no llvm.coro.free to anchor the arena's
+// teardown on.
+static bool elideArenaSite(const BulkRangeSite &Site, Function *Caller,
+                           Function *SelfNoAlloc) {
+  SmallVector<Instruction *, 2> CoroFrees;
+  for (Instruction &I : instructions(*Caller))
+    if (isa<CoroFreeInst>(&I))
+      CoroFrees.push_back(&I);
+  if (CoroFrees.empty())
+    return false;
+
+  LLVMContext &Ctx = Caller->getContext();
+  Module *M = Caller->getParent();
+  const DataLayout &DL = Caller->getDataLayout();
+  auto *I64 = Type::getInt64Ty(Ctx);
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  auto *NullPtr = ConstantPointerNull::get(PtrTy);
+  FunctionCallee AlignedAlloc =
+      M->getOrInsertFunction("aligned_alloc", PtrTy, I64, I64);
+  FunctionCallee Malloc = M->getOrInsertFunction("malloc", PtrTy, I64);
+  FunctionCallee Free =
+      M->getOrInsertFunction("free", Type::getVoidTy(Ctx), PtrTy);
+  CallBase *C = Site.CreationCall;
+  BasicBlock *Header = Site.L->getHeader();
+
+  // Hidden per-activation state; lives across suspends and spills into the
+  // frame. The capacity is only tracked for dynamically sized arenas,
+  // whose needed size can differ between entries of the loop.
+  Instruction *InitPt = getFirstNonAllocaInEntry(Caller);
+  auto *ArenaA = new AllocaInst(PtrTy, DL.getAllocaAddrSpace(), "coro.arena",
+                                InitPt->getIterator());
+  AllocaInst *CapA = nullptr;
+  if (Site.TripCount)
+    CapA = new AllocaInst(I64, DL.getAllocaAddrSpace(), "coro.arena.cap",
+                          InitPt->getIterator());
+  IRBuilder<> B(InitPt);
+  B.CreateStore(NullPtr, ArenaA);
+  if (CapA)
+    B.CreateStore(ConstantInt::get(I64, 0), CapA);
+
+  // The padded slot size, this generation's own frame size rounded up to
+  // its alignment; the intrinsics fold to constants when it is split. For
+  // exactly sized arenas the computation must sit in the preheader (the
+  // needed size takes part in the per-entry shrink check; the trip count
+  // was expanded there, or folded to a constant); otherwise it sits with
+  // the creation call.
+  if (Site.TripCount)
+    B.SetInsertPoint(Site.L->getLoopPreheader()->getTerminator());
+  else
+    B.SetInsertPoint(C);
+  Value *FrameSize = B.CreateIntrinsic(I64, Intrinsic::coro_size, {});
+  Value *FrameAlign = B.CreateIntrinsic(I64, Intrinsic::coro_align, {});
+  // Optionally pack the slots at whole cache lines (the runtime's own
+  // frame allocations are line-rounded) so concurrently running sibling
+  // frames never share one; costs padding bytes and the allocator's
+  // aligned path.
+  Value *PadAlign =
+      CoroBulkArenaLineAlign
+          ? B.CreateBinaryIntrinsic(Intrinsic::umax, FrameAlign,
+                                    ConstantInt::get(I64, 64))
+          : FrameAlign;
+  Value *AlignM1 = B.CreateSub(PadAlign, ConstantInt::get(I64, 1));
+  Value *Padded = B.CreateAnd(B.CreateAdd(FrameSize, AlignM1),
+                              B.CreateNot(AlignM1), "coro.arena.slotsize");
+  // Exactly counted arenas are still rounded up to the default slot
+  // target: the tail slots are never touched (children allocate lazily
+  // into their slot), but the constant size below the floor keeps the
+  // arena in a single hot allocator size class, which recycles far better
+  // than one class per fan-out.
+  Value *NSlots = ConstantInt::get(I64, Site.NSlots);
+  if (Site.TripCount) {
+    NSlots = B.CreateBinaryIntrinsic(
+        Intrinsic::umin, Site.TripCount,
+        ConstantInt::get(I64, CoroBulkMaxArenaSlots.getValue()));
+    NSlots = B.CreateBinaryIntrinsic(
+        Intrinsic::umax, NSlots,
+        ConstantInt::get(I64, CoroBulkDefaultSlots.getValue()));
+  }
+  Value *Need = B.CreateMul(NSlots, Padded, "coro.arena.need");
+
+  // Exactly counted arenas are ensured eagerly in the preheader -- a
+  // nonzero count proves a creation follows, so this allocates no earlier
+  // than the lazy form would -- which keeps the in-loop path branchless.
+  // Re-entries with a larger need than the retained capacity release the
+  // old arena first. The ensured arena and its usability are then loop
+  // invariants.
+  Value *ArenaLive = nullptr;
+  Value *ArenaUsable = nullptr;
+  if (Site.TripCount) {
+    Instruction *PHTerm = &*B.GetInsertPoint();
+    Value *Arena0 = B.CreateLoad(PtrTy, ArenaA);
+    Value *MustAlloc = B.CreateAnd(
+        B.CreateICmpNE(Site.TripCount, ConstantInt::get(I64, 0)),
+        B.CreateOr(B.CreateICmpEQ(Arena0, NullPtr),
+                   B.CreateICmpULT(B.CreateLoad(I64, CapA), Need)));
+    Instruction *ThenTerm = SplitBlockAndInsertIfThen(
+        MustAlloc, B.GetInsertPoint(), /*Unreachable=*/false);
+    B.SetInsertPoint(ThenTerm);
+    Instruction *FreeTerm = SplitBlockAndInsertIfThen(
+        B.CreateICmpNE(Arena0, NullPtr), B.GetInsertPoint(),
+        /*Unreachable=*/false);
+    IRBuilder<> FB(FreeTerm);
+    FB.CreateCall(Free, Arena0);
+    B.SetInsertPoint(ThenTerm);
+    Value *Fresh = CoroBulkArenaLineAlign
+                       ? B.CreateCall(AlignedAlloc, {PadAlign, Need})
+                       : B.CreateCall(Malloc, Need);
+    B.CreateStore(Fresh, ArenaA);
+    B.CreateStore(Need, CapA);
+    // Back on the main path (PHTerm followed the splits into the tail
+    // block), reload the ensured arena once per entry.
+    B.SetInsertPoint(PHTerm);
+    ArenaLive = B.CreateLoad(PtrTy, ArenaA, "coro.arena.live");
+    ArenaUsable = B.CreateICmpNE(ArenaLive, NullPtr);
+  }
+
+  // The per-entry execution counter, as for in-frame slots: entering the
+  // loop restarts it, each started execution increments it before the
+  // call.
+  auto *Idx = PHINode::Create(I64, pred_size(Header), "coro.arena.idx",
+                              Header->begin());
+  auto *Inc = BinaryOperator::CreateNUWAdd(
+      Idx, ConstantInt::get(I64, 1), "", C->getIterator());
+  for (BasicBlock *Pred : predecessors(Header))
+    Idx->addIncoming(Site.L->contains(Pred)
+                         ? static_cast<Value *>(Inc)
+                         : static_cast<Value *>(ConstantInt::get(I64, 0)),
+                     Pred);
+
+  // In front of the creation call: executions within the slot target take
+  // their slot; the rest -- beyond the target, or with the allocation
+  // failed -- pass a null slot and fall back to the published symbol in
+  // the dispatch below.
+  Value *SlotOrNull;
+  if (Site.TripCount) {
+    // The arena was ensured in the preheader: the in-loop path is a
+    // branchless select on loop-invariant operands.
+    B.SetInsertPoint(C);
+    Value *RawSlot = B.CreateGEP(Type::getInt8Ty(Ctx), ArenaLive,
+                                 B.CreateNUWMul(Idx, Padded));
+    Value *Ok = B.CreateAnd(B.CreateICmpULT(Idx, NSlots), ArenaUsable);
+    SlotOrNull = B.CreateSelect(Ok, RawSlot, NullPtr, "coro.arena.slotsel");
+  } else {
+    // No usable count: the arena is allocated lazily at the first
+    // creation, so activations without children never pay.
+    BasicBlock *BB = C->getParent();
+    auto *InBounds =
+        new ICmpInst(C->getIterator(), ICmpInst::ICMP_ULT, Idx, NSlots);
+    BasicBlock *ContBB = SplitBlock(BB, C->getIterator());
+    ContBB->setName(BB->getName() + ".arena.cont");
+    auto *EnsureBB = BasicBlock::Create(
+        Ctx, BB->getName() + ".arena.ensure", Caller, ContBB);
+    auto *AllocBB = BasicBlock::Create(Ctx, BB->getName() + ".arena.alloc",
+                                       Caller, ContBB);
+    auto *SlotBB = BasicBlock::Create(Ctx, BB->getName() + ".arena.slot",
+                                      Caller, ContBB);
+    BB->getTerminator()->eraseFromParent();
+    CondBrInst::Create(InBounds, EnsureBB, ContBB, BB);
+
+    B.SetInsertPoint(EnsureBB);
+    Value *Arena0 = B.CreateLoad(PtrTy, ArenaA);
+    B.CreateCondBr(B.CreateICmpEQ(Arena0, NullPtr), AllocBB, SlotBB);
+
+    B.SetInsertPoint(AllocBB);
+    Value *Arena1 = CoroBulkArenaLineAlign
+                        ? B.CreateCall(AlignedAlloc, {PadAlign, Need})
+                        : B.CreateCall(Malloc, Need);
+    B.CreateStore(Arena1, ArenaA);
+    B.CreateBr(SlotBB);
+
+    B.SetInsertPoint(SlotBB);
+    auto *ArenaPhi = B.CreatePHI(PtrTy, 2);
+    ArenaPhi->addIncoming(Arena0, EnsureBB);
+    ArenaPhi->addIncoming(Arena1, AllocBB);
+    Value *RawSlot = B.CreateGEP(Type::getInt8Ty(Ctx), ArenaPhi,
+                                 B.CreateNUWMul(Idx, Padded));
+    Value *Slot = B.CreateSelect(B.CreateICmpNE(ArenaPhi, NullPtr), RawSlot,
+                                 NullPtr);
+    B.CreateBr(ContBB);
+
+    B.SetInsertPoint(ContBB, ContBB->begin());
+    auto *SlotPhi = B.CreatePHI(PtrTy, 2, "coro.arena.slotsel");
+    SlotPhi->addIncoming(NullPtr, BB);
+    SlotPhi->addIncoming(Slot, SlotBB);
+    SlotOrNull = SlotPhi;
+  }
+
+  rewriteToGuardedDispatch(C, SlotOrNull, SelfNoAlloc);
+
+  // Release the arena wherever this activation's frame dies: children have
+  // completed before the joining await resumes (the range attribute's
+  // contract), so teardown strictly follows the last slot's use. Most
+  // activations are leaves that never allocated one, so the free hides
+  // behind a null check.
+  for (Instruction *CF : CoroFrees) {
+    B.SetInsertPoint(CF);
+    Value *A = B.CreateLoad(PtrTy, ArenaA);
+    Instruction *ThenTerm = SplitBlockAndInsertIfThen(
+        B.CreateICmpNE(A, NullPtr), B.GetInsertPoint(), /*Unreachable=*/false);
+    B.SetInsertPoint(ThenTerm);
+    B.CreateCall(Free, A);
+  }
+  return true;
 }
 
 // Point the coroutine id of a freshly cloned coroutine at the clone itself.
@@ -667,6 +1041,7 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
     // and elide every cycle call site whose callee generation fits.
     SmallVector<Function *, 2> Next(N, nullptr);
     SmallVector<bool, 2> Elided(N, false);
+    SmallVector<bool, 2> ArenaSaturated(N, false);
     for (unsigned I = 0; I != N; ++I) {
       if (Saturated[I])
         continue;
@@ -707,11 +1082,61 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
           [&](Function *Callee) { return OrigIndex.contains(Callee); },
           BulkSites);
 
+      // Loop sites whose creation call targets this member itself take the
+      // per-activation arena (see elideArenaSite): frames stay small, the
+      // arena is lazily allocated and exactly sized where possible, and one
+      // generation covers every level of the recursion. Trip counts must be
+      // materialized before any elision mutates G (SCEV validity).
+      for (BulkRangeSite &BS : BulkSites) {
+        if (!BS.L || BS.CreationCall->getCalledFunction() != Group[I].second)
+          continue;
+        const GenState &Callee =
+            Cur[OrigIndex[BS.CreationCall->getCalledFunction()]];
+        // The final generation frame is generation 0's plus a few pointer
+        // fields, so gate the arena trade and the malloc'd arena's
+        // alignment guarantee on generation 0 as a proxy. A site over the
+        // size threshold is skipped outright: in-frame slots would charge
+        // every activation for the worst case (the original uts
+        // regression), and large frames recycle better individually.
+        if (Callee.FrameSize > CoroBulkArenaMaxFrameSize ||
+            Callee.FrameAlign.value() > 16) {
+          BS.Skipped = true;
+          if (CoroBulkDebug)
+            errs() << "[bulk]   skip self loop site (frame "
+                   << Callee.FrameSize << " over arena threshold)\n";
+          continue;
+        }
+        BS.SelfArena = true;
+        // Exact sizing anchors the count (and the arena's shrink check) in
+        // the preheader; give the loop one if it lacks it.
+        if (!BS.L->getLoopPreheader())
+          InsertPreheaderForLoop(BS.L, &DT, &LI, /*MSSAU=*/nullptr,
+                                 /*PreserveLCSSA=*/false);
+        BS.TripCount = materializeArenaTripCount(BS.L, SE);
+        // Without an exact count, a known bound sizes the arena only up to
+        // the default slot target: filtered creation loops typically run
+        // far below their structural bound, and every activation would pay
+        // the full reservation.
+        if (!BS.TripCount)
+          BS.NSlots = std::min(BS.KnownBound ? BS.KnownBound : UINT64_MAX,
+                               CoroBulkDefaultSlots.getValue());
+        if (CoroBulkDebug) {
+          errs() << "[bulk]   arena site in "
+                 << BS.CreationCall->getParent()->getName() << " count=";
+          if (BS.TripCount)
+            errs() << "dynamic";
+          else
+            errs() << BS.NSlots;
+          errs() << "\n";
+        }
+      }
+
       // A generation that elides only part of the sites that structurally
       // fit (unit cap passed, accumulated cap exceeded) is abandoned: the
       // mix of nested children and full-block escapes measures worse than
       // stopping at the previous, fully nested generation.
       bool Partial = false;
+      bool NonArenaElision = false;
       for (CallBase *CB : Sites) {
         const GenState &Callee = Cur[OrigIndex[CB->getCalledFunction()]];
         if (Callee.FrameSize > CoroElideMaxFrameSize)
@@ -723,8 +1148,20 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
         }
         elideSite(CB, G, Callee.NoAlloc, Callee.FrameSize, Callee.FrameAlign);
         Elided[I] = true;
+        NonArenaElision = true;
       }
       for (BulkRangeSite &BS : BulkSites) {
+        if (BS.Skipped)
+          continue;
+        if (BS.SelfArena) {
+          if (elideArenaSite(BS, G, getOrCreateSelfNoAllocDecl(G))) {
+            Elided[I] = true;
+            continue;
+          }
+          // No teardown anchor; the in-frame worst-case reservation is
+          // not an acceptable substitute -- leave the site unelided.
+          continue;
+        }
         const GenState &Callee =
             Cur[OrigIndex[BS.CreationCall->getCalledFunction()]];
         if (Callee.FrameSize > CoroElideMaxFrameSize)
@@ -757,12 +1194,22 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
         elideBulkSite(BS, G, Callee.NoAlloc, Callee.FrameSize,
                       Callee.FrameAlign);
         Elided[I] = true;
+        NonArenaElision = true;
       }
+      // An arena needs no deeper generations: its children already run this
+      // very generation. Members whose only elisions are arenas are done
+      // after this one.
+      if (Elided[I] && !NonArenaElision)
+        ArenaSaturated[I] = true;
 
       if (Partial) {
         LLVM_DEBUG(dbgs() << "CoroRecursiveElide: abandoning partial '"
                           << G->getName() << "'\n");
+        std::string PreDeclName = (G->getName() + ".noalloc.self").str();
         G->eraseFromParent();
+        if (Function *PreDecl = M.getFunction(PreDeclName))
+          if (PreDecl->use_empty())
+            PreDecl->eraseFromParent();
         Next[I] = nullptr;
         Elided[I] = false;
         Saturated[I] = true;
@@ -778,7 +1225,12 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
       if (!Next[I])
         continue;
       if (!Elided[I]) {
+        std::string PreDeclName =
+            (Next[I]->getName() + ".noalloc.self").str();
         Next[I]->eraseFromParent();
+        if (Function *PreDecl = M.getFunction(PreDeclName))
+          if (PreDecl->use_empty())
+            PreDecl->eraseFromParent();
         Saturated[I] = true;
         continue;
       }
@@ -787,17 +1239,34 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
       coro::splitStandaloneCoroutine(*Next[I], TTI, Clones,
                                      /*OptimizeFrame=*/true,
                                      /*ForceNoAllocVariant=*/true);
+      // Bind self-referential arena children to the freshly split
+      // `.noalloc`.
+      if (Function *PreDecl =
+              M.getFunction((Next[I]->getName() + ".noalloc.self").str())) {
+        if (Function *Real =
+                M.getFunction((Next[I]->getName() + ".noalloc").str()))
+          PreDecl->replaceAllUsesWith(Real);
+        if (PreDecl->use_empty())
+          PreDecl->eraseFromParent();
+      }
+      // Frame growth is the ladder's progress signal, but an arena
+      // generation is useful even when the added bookkeeping hides in
+      // frame padding; it is accepted unconditionally and, being
+      // self-covering, ends its member's ladder.
       GenState NewState;
       if (!readGenState(M, Next[I], NewState) ||
-          NewState.FrameSize <= Cur[I].FrameSize) {
+          (NewState.FrameSize <= Cur[I].FrameSize && !ArenaSaturated[I])) {
         Saturated[I] = true;
         continue;
       }
       LLVM_DEBUG(dbgs() << "CoroRecursiveElide: '" << Next[I]->getName()
                         << "' frame " << NewState.FrameSize << " bytes\n");
       Cur[I] = NewState;
-      Progress = true;
       AnyGenerationBuilt = true;
+      if (ArenaSaturated[I])
+        Saturated[I] = true;
+      else
+        Progress = true;
     }
     if (!Progress)
       break;

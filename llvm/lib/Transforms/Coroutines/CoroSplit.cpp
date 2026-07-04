@@ -1995,7 +1995,7 @@ void coro::SwitchABI::splitCoroutine(Function &F, coro::Shape &Shape,
 
 static void doSplitCoroutine(Function &F, SmallVectorImpl<Function *> &Clones,
                              coro::BaseABI &ABI, TargetTransformInfo &TTI,
-                             bool OptimizeFrame) {
+                             bool OptimizeFrame, bool ForceNoAllocVariant) {
   PrettyStackTraceFunction prettyStackTrace(F);
 
   auto &Shape = ABI.Shape;
@@ -2013,7 +2013,8 @@ static void doSplitCoroutine(Function &F, SmallVectorImpl<Function *> &Clones,
 
   bool shouldCreateNoAllocVariant =
       !isNoSuspendCoroutine && Shape.ABI == coro::ABI::Switch &&
-      hasSafeElideCaller(F) && !F.hasFnAttribute(llvm::Attribute::NoInline);
+      (hasSafeElideCaller(F) || ForceNoAllocVariant) &&
+      !F.hasFnAttribute(llvm::Attribute::NoInline);
 
   // If there are no suspend points, no split required, just remove
   // the allocation and deallocation blocks, they are not needed.
@@ -2206,6 +2207,27 @@ CoroSplitPass::CoroSplitPass(
       }),
       OptimizeFrame(OptimizeFrame) {}
 
+
+// Split a single presplit coroutine outside the CGSCC pipeline (no call
+// graph updates are performed; only valid where the caller does not rely on
+// LazyCallGraph, e.g. from a module pass that runs after the CGSCC
+// pipeline). ForceNoAllocVariant creates the `.noalloc` variant even when no
+// coro_elide_safe caller exists yet, for callers that will be created later.
+void coro::splitStandaloneCoroutine(Function &F, TargetTransformInfo &TTI,
+                                    SmallVectorImpl<Function *> &Clones,
+                                    bool OptimizeFrame,
+                                    bool ForceNoAllocVariant) {
+  assert(F.isPresplitCoroutine() && "function must be a presplit coroutine");
+  removeUnreachableBlocks(F);
+  coro::Shape Shape(F);
+  if (!Shape.CoroBegin)
+    return;
+  F.setSplittedCoroutine();
+  std::unique_ptr<coro::BaseABI> ABI =
+      CreateNewABI(F, Shape, coro::isTriviallyMaterializable, {});
+  ABI->init();
+  doSplitCoroutine(F, Clones, *ABI, TTI, OptimizeFrame, ForceNoAllocVariant);
+}
 PreservedAnalyses CoroSplitPass::run(LazyCallGraph::SCC &C,
                                      CGSCCAnalysisManager &AM,
                                      LazyCallGraph &CG, CGSCCUpdateResult &UR) {
@@ -2224,7 +2246,8 @@ PreservedAnalyses CoroSplitPass::run(LazyCallGraph::SCC &C,
   // Find coroutines for processing.
   SmallVector<LazyCallGraph::Node *> Coroutines;
   for (LazyCallGraph::Node &N : C)
-    if (N.getFunction().isPresplitCoroutine())
+    if (N.getFunction().isPresplitCoroutine() &&
+        !N.getFunction().hasFnAttribute("coro.recursive.template"))
       Coroutines.push_back(&N);
 
   if (Coroutines.empty() && PrepareFns.empty())
@@ -2252,7 +2275,8 @@ PreservedAnalyses CoroSplitPass::run(LazyCallGraph::SCC &C,
 
     SmallVector<Function *, 4> Clones;
     auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
-    doSplitCoroutine(F, Clones, *ABI, TTI, OptimizeFrame);
+    doSplitCoroutine(F, Clones, *ABI, TTI, OptimizeFrame,
+                     /*ForceNoAllocVariant=*/false);
     CurrentSCC = &updateCallGraphAfterCoroutineSplit(
         *N, Shape, Clones, *CurrentSCC, CG, AM, UR, FAM);
 

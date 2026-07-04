@@ -41,7 +41,7 @@
 #include "llvm/Transforms/Coroutines/CoroConditionalWrapper.h"
 #include "llvm/Transforms/Coroutines/CoroEarly.h"
 #include "llvm/Transforms/Coroutines/CoroElide.h"
-#include "llvm/Transforms/Coroutines/CoroRecursionPeel.h"
+#include "llvm/Transforms/Coroutines/CoroRecursiveElide.h"
 #include "llvm/Transforms/Coroutines/CoroSplit.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -1163,7 +1163,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     MPM.addPass(InferFunctionAttrsPass());
     MPM.addPass(CoroEarlyPass());
     if (Level != OptimizationLevel::O0)
-      MPM.addPass(CoroRecursionPeelPass());
+      MPM.addPass(CoroRecursionStashPass());
 
     FunctionPassManager EarlyFPM;
     EarlyFPM.addPass(EntryExitInstrumenterPass(/*PostInlining=*/false));
@@ -1330,6 +1330,12 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // Remove any dead arguments exposed by cleanups, constant folding globals,
   // and argument promotion.
   MPM.addPass(DeadArgumentEliminationPass());
+
+  // Now that coroutines are split and real frame sizes exist, grow block
+  // specializations of recursive coroutines from the templates stashed
+  // before the CGSCC pipeline. Must run before CoroCleanup.
+  if (Level != OptimizationLevel::O0)
+    MPM.addPass(CoroRecursiveElidePass());
 
   if (isThinLTOPostLink(Phase))
     MPM.addPass(SimplifyTypeTestsPass());

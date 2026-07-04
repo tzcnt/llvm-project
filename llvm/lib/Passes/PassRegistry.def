@@ -63,6 +63,8 @@ MODULE_PASS("constmerge", ConstantMergePass())
 MODULE_PASS("coro-cleanup", CoroCleanupPass())
 MODULE_PASS("coro-early", CoroEarlyPass())
 MODULE_PASS("coro-recursion-peel", CoroRecursionPeelPass())
+MODULE_PASS("coro-recursion-stash", CoroRecursionStashPass())
+MODULE_PASS("coro-recursive-elide", CoroRecursiveElidePass())
 MODULE_PASS("lower-comment-string", LowerCommentStringPass())
 MODULE_PASS("cross-dso-cfi", CrossDSOCFIPass())
 MODULE_PASS("ctx-instr-gen",

@@ -54,6 +54,14 @@ struct LowererBase {
 bool defaultMaterializable(Instruction &V);
 void normalizeCoroutine(Function &F, coro::Shape &Shape,
                         TargetTransformInfo &TTI);
+/// Split a single presplit coroutine outside the CGSCC pipeline. Performs no
+/// call graph updates, so it is only usable where nothing relies on
+/// LazyCallGraph (e.g. a module pass after the CGSCC pipeline).
+/// ForceNoAllocVariant creates the `.noalloc` variant even when no
+/// coro_elide_safe caller exists yet.
+void splitStandaloneCoroutine(Function &F, TargetTransformInfo &TTI,
+                              SmallVectorImpl<Function *> &Clones,
+                              bool OptimizeFrame, bool ForceNoAllocVariant);
 CallInst *createMustTailCall(DebugLoc Loc, Function *MustTailCallFn,
                              TargetTransformInfo &TTI,
                              ArrayRef<Value *> Arguments, IRBuilder<> &);

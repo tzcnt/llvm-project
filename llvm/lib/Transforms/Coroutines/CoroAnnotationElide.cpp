@@ -68,7 +68,7 @@ static cl::opt<float> CoroElideBranchRatio(
 // preferentially rejects the later visited (larger, in postorder) children
 // and fragments the task tree into long-lived chains touched at widely
 // separated fork and join times.
-static cl::opt<uint64_t> CoroElideMaxFrameSize(
+cl::opt<uint64_t> CoroElideMaxFrameSize(
     "coro-elide-max-frame-size", cl::init(4096), cl::Hidden,
     cl::desc("Maximum callee coroutine frame size, in bytes, that may be "
              "elided into a caller's frame. Larger callee frames remain "
@@ -81,7 +81,7 @@ static cl::opt<uint64_t> CoroElideMaxFrameSize(
 // heap-allocated. It is a backstop for wide fan-out bodies (e.g. a variadic
 // join of dozens of tasks); at 4x the per-callee limit it never binds for
 // fan-outs of four or fewer maximum-size children.
-static cl::opt<uint64_t> CoroElideMaxAccumulatedFrameSize(
+cl::opt<uint64_t> CoroElideMaxAccumulatedFrameSize(
     "coro-elide-max-accumulated-frame-size", cl::init(16384), cl::Hidden,
     cl::desc("Maximum total size, in bytes, of callee coroutine frames "
              "elided into any one caller's frame. Callee frames that do not "
@@ -212,6 +212,12 @@ PreservedAnalyses CoroAnnotationElidePass::run(LazyCallGraph::SCC &C,
     for (auto *CB : Users) {
       auto *Caller = CB->getFunction();
       if (!Caller)
+        continue;
+
+      // Recursion templates are stashed presplit copies kept only as cloning
+      // material for CoroRecursiveElide; eliding into them would duplicate
+      // the elision when generations are cloned from them later.
+      if (Caller->hasFnAttribute("coro.recursive.template"))
         continue;
 
       bool IsCallerPresplitCoroutine = Caller->isPresplitCoroutine();

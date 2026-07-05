@@ -113,6 +113,15 @@ static cl::opt<unsigned> CoroRecursiveElideMaxGenerations(
              "generation nests one more level of the recursion. 0 disables "
              "recursive elision."));
 
+static cl::opt<bool> CoroRecursiveElideInlineRamp(
+    "coro-recursive-elide-inline-ramp", cl::init(true), cl::Hidden,
+    cl::desc("After republishing, inline the block ramp into the cycle "
+             "re-entry call sites in the originals' split clones. The "
+             "stash-time noinline pins only exist to keep those sites "
+             "outlined symbol references until the republish has "
+             "retargeted them; past that point the ramp is an ordinary "
+             "small function and staying outlined is pure call overhead."));
+
 static cl::opt<uint64_t> CoroBulkDefaultSlots(
     "coro-elide-bulk-default-slots", cl::init(8), cl::Hidden,
     cl::desc("Maximum frame slots reserved for one bulk range creation "
@@ -1297,6 +1306,48 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
     Top->setName(Name);
     LLVM_DEBUG(dbgs() << "CoroRecursiveElide: republished '" << Name
                       << "' as a " << Cur[I].FrameSize << "-byte block\n");
+  }
+
+  // The stash-time pins kept every cycle re-entry an outlined reference to
+  // the original symbol so the RAUW above could retarget it into the block
+  // ramp; a glue-inlined copy of the allocating ramp would have pinned its
+  // branch of the recursion to unelided frames forever. Republished, the
+  // block ramp is an ordinary small function, and the re-entry sites live
+  // in the originals' split clones, which no inliner visits again -- so
+  // fold the ramp into them here, as the CGSCC inliner does for ordinary
+  // split ramps. The guarded-dispatch escape legs inside the generations
+  // keep their own noinline and stay outlined.
+  if (CoroRecursiveElideInlineRamp) {
+    SmallPtrSet<Function *, 4> Tops;
+    for (unsigned I = 0; I != N; ++I)
+      if (Cur[I].Fn != Group[I].second)
+        Tops.insert(Cur[I].Fn);
+    for (unsigned I = 0; I != N; ++I) {
+      if (Cur[I].Fn == Group[I].second)
+        continue;
+      // The republished name is the prefix the original's clones were
+      // split under during the CGSCC pipeline.
+      StringRef Name = Cur[I].Fn->getName();
+      for (StringRef Suffix : {".resume", ".destroy", ".cleanup"}) {
+        Function *Clone = M.getFunction((Name + Suffix).str());
+        if (!Clone || Clone->isDeclaration())
+          continue;
+        SmallVector<CallBase *, 16> ReentrySites;
+        for (Instruction &Inst : instructions(*Clone))
+          if (auto *CB = dyn_cast<CallBase>(&Inst))
+            if (CB->getCalledFunction() &&
+                Tops.contains(CB->getCalledFunction()))
+              ReentrySites.push_back(CB);
+        for (CallBase *CB : ReentrySites) {
+          CB->removeFnAttr(llvm::Attribute::NoInline);
+          InlineFunctionInfo IFI;
+          if (InlineFunction(*CB, IFI).isSuccess())
+            LLVM_DEBUG(dbgs() << "CoroRecursiveElide: inlined block ramp "
+                                 "re-entry in '"
+                              << Clone->getName() << "'\n");
+        }
+      }
+    }
   }
 
   // The noinline markers added at stash time have served their purpose;

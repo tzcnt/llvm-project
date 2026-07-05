@@ -25,14 +25,43 @@ using namespace llvm;
 
 #define DEBUG_TYPE "coro-cleanup"
 
+// libstdc++ implements std::noop_coroutine() without __builtin_coro_noop. The
+// handle it returns points at an ordinary global frame object whose resume
+// and destroy slots both hold a private empty function:
+//
+//   struct __frame {
+//     static void __dummy_resume_destroy() { }
+//     void (*__r)() = __dummy_resume_destroy;
+//     void (*__d)() = __dummy_resume_destroy;
+//     struct noop_coroutine_promise __p;
+//   };
+//   static __frame _S_fr;
+//
+// The global is writable, so no generic pass can fold loads out of it, and
+// every symmetric transfer that may continue to std::noop_coroutine() lowers
+// to an indirect jump to the empty function. [coroutine.handle.noop]
+// guarantees that resuming or destroying the noop coroutine has no observable
+// effects, and _S_fr is a reserved-name implementation detail no conforming
+// program can modify, so resume/destroy calls made through this handle can be
+// elided exactly like those on the llvm.coro.noop() frame. Only that
+// consumption is rewritten; other uses (and thus the handle's pointer
+// identity) are left intact.
+static GlobalVariable *getLibstdcxxNoopFrame(Module &M) {
+  return M.getNamedGlobal(
+      "_ZNSt7__n486116coroutine_handleINS_22noop_coroutine_promiseEE5_S_frE");
+}
+
 namespace {
 // Created on demand if CoroCleanup pass has work to do.
 struct Lowerer : coro::LowererBase {
   IRBuilder<> Builder;
   Constant *NoopCoro = nullptr;
+  GlobalVariable *LibstdcxxNoopFrame = nullptr;
   bool CFGChanged = false;
 
-  Lowerer(Module &M) : LowererBase(M), Builder(Context) {}
+  Lowerer(Module &M)
+      : LowererBase(M), Builder(Context),
+        LibstdcxxNoopFrame(getLibstdcxxNoopFrame(M)) {}
   bool lower(Function &F);
 
 private:
@@ -46,6 +75,8 @@ class NoopCoroElider : public PtrUseVisitor<NoopCoroElider> {
   IRBuilder<> Builder;
 
 public:
+  bool CFGChanged = false;
+
   NoopCoroElider(const DataLayout &DL, LLVMContext &C) : Base(DL), Builder(C) {}
 
   void run(IntrinsicInst *II);
@@ -166,7 +197,9 @@ static void buildDebugInfoForNoopResumeDestroyFunc(Function *NoopFn) {
 static bool feedsElidableCall(Value *V, BasicBlock *BB) {
   for (User *U : V->users()) {
     if (auto *SubFn = dyn_cast<CoroSubFnInst>(U)) {
-      if (SubFn->getFrame() == V && SubFn->getParent() == BB)
+      if (SubFn->getFrame() == V && SubFn->getParent() == BB &&
+          (SubFn->getIndex() == CoroSubFnInst::ResumeIndex ||
+           SubFn->getIndex() == CoroSubFnInst::DestroyIndex))
         return true;
     } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
       if (GEP->getPointerOperand() == V && GEP->getParent() == BB &&
@@ -197,11 +230,14 @@ static bool feedsElidableCall(Value *V, BasicBlock *BB) {
 //   ret void
 //
 // The phi hides the noop handle from NoopCoroElider, so the noop paths lower
-// to an indirect jump to __NoopCoro_ResumeDestroy, a function that consists of
-// a single ret. Redirect the noop-carrying edges to a specialized clone of the
-// block in which the handle is the noop coroutine directly; the regular
-// elision then deletes the call in the clone, so those paths simply return.
-static bool threadNoopPhiEdges(IntrinsicInst *NoopCoro) {
+// to an indirect jump to the noop coroutine's empty resume function. Redirect
+// the noop-carrying edges to a specialized clone of the block in which the
+// handle is the noop coroutine directly; the regular elision then deletes the
+// call in the clone, so those paths simply return.
+//
+// \p NoopCoro is the known-noop handle: the llvm.coro.noop() call or
+// libstdc++'s noop frame global.
+static bool threadNoopPhiEdges(Value *NoopCoro, Function &F) {
   // Modest limit on the number of instructions duplicated per specialized
   // predecessor.
   constexpr unsigned MaxBlockSize = 16;
@@ -209,7 +245,8 @@ static bool threadNoopPhiEdges(IntrinsicInst *NoopCoro) {
   SmallSetVector<PHINode *, 4> Phis;
   for (User *U : NoopCoro->users())
     if (auto *PN = dyn_cast<PHINode>(U))
-      Phis.insert(PN);
+      if (PN->getFunction() == &F)
+        Phis.insert(PN);
 
   bool Changed = false;
   for (PHINode *PN : Phis) {
@@ -294,9 +331,115 @@ static bool threadNoopPhiEdges(IntrinsicInst *NoopCoro) {
   return Changed;
 }
 
+// Erase a call or invoke to a function known to do nothing. For invokes the
+// unwind edge is removed and control continues at the normal destination.
+static bool eraseNoopCallOrInvoke(CallBase *CB, bool &CFGChanged) {
+  if (auto *Invoke = dyn_cast<InvokeInst>(CB)) {
+    UncondBrInst::Create(Invoke->getNormalDest(), Invoke->getIterator());
+    Invoke->getUnwindDest()->removePredecessor(Invoke->getParent());
+    CFGChanged = true;
+  } else if (!isa<CallInst>(CB)) {
+    return false;
+  }
+  CB->eraseFromParent();
+  return true;
+}
+
+// Erase resume and destroy calls made through the known-noop coroutine handle
+// \p NoopHandle within \p F: llvm.coro.subfn.addr calls on the handle, and
+// calls through a function pointer loaded from the handle's resume (+0) or
+// destroy (+PtrSize) slot. Other uses of the handle are left intact, so its
+// pointer identity is preserved.
+static bool elideNoopHandleUses(Value *NoopHandle, Function &F,
+                                bool &CFGChanged) {
+  const DataLayout &DL = F.getDataLayout();
+  uint64_t PtrSize = DL.getPointerSize();
+  bool Changed = false;
+
+  // Only collect the consumers handled below. In particular a call that
+  // merely passes the handle as an argument must not be collected: it may be
+  // erased while processing the subfn/load it is a user of, which would leave
+  // a dangling entry here.
+  SmallVector<Instruction *, 8> Users;
+  for (User *U : NoopHandle->users()) {
+    if (!isa<CoroSubFnInst>(U) && !isa<LoadInst>(U) &&
+        !isa<GetElementPtrInst>(U))
+      continue;
+    auto *I = cast<Instruction>(U);
+    if (I->getFunction() == &F)
+      Users.push_back(I);
+  }
+
+  auto EraseCallsThrough = [&](Instruction *FnPtr) {
+    SmallSetVector<CallBase *, 2> Calls;
+    for (User *U : FnPtr->users())
+      if (auto *CB = dyn_cast<CallBase>(U))
+        if (CB->getCalledOperand() == FnPtr)
+          Calls.insert(CB);
+    for (CallBase *CB : Calls)
+      Changed |= eraseNoopCallOrInvoke(CB, CFGChanged);
+  };
+
+  auto ElideLoadedSlot = [&](LoadInst *Load, uint64_t Offset) {
+    if (Load->isVolatile() || !Load->getType()->isPointerTy() ||
+        (Offset != 0 && Offset != PtrSize))
+      return;
+    EraseCallsThrough(Load);
+    if (Load->use_empty()) {
+      Load->eraseFromParent();
+      Changed = true;
+    }
+  };
+
+  for (Instruction *I : Users) {
+    if (auto *SubFn = dyn_cast<CoroSubFnInst>(I)) {
+      if (SubFn->getFrame() != NoopHandle ||
+          (SubFn->getIndex() != CoroSubFnInst::ResumeIndex &&
+           SubFn->getIndex() != CoroSubFnInst::DestroyIndex))
+        continue;
+      EraseCallsThrough(SubFn);
+      if (SubFn->use_empty()) {
+        SubFn->eraseFromParent();
+        Changed = true;
+      }
+    } else if (auto *Load = dyn_cast<LoadInst>(I)) {
+      if (Load->getPointerOperand() == NoopHandle)
+        ElideLoadedSlot(Load, 0);
+    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+      if (GEP->getPointerOperand() != NoopHandle)
+        continue;
+      APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+      if (!GEP->accumulateConstantOffset(DL, Offset))
+        continue;
+      SmallVector<LoadInst *, 2> Loads;
+      for (User *U : GEP->users())
+        if (auto *L = dyn_cast<LoadInst>(U))
+          if (L->getPointerOperand() == GEP)
+            Loads.push_back(L);
+      for (LoadInst *L : Loads)
+        ElideLoadedSlot(L, Offset.getZExtValue());
+      if (GEP->use_empty()) {
+        GEP->eraseFromParent();
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 bool Lowerer::lower(Function &F) {
   bool IsPrivateAndUnprocessed = F.isPresplitCoroutine() && F.hasLocalLinkage();
   bool Changed = false;
+
+  // libstdc++'s noop coroutine handle is an ordinary global rather than
+  // llvm.coro.noop(); specialize phi-merged handles and elide its
+  // resume/destroy uses the same way.
+  if (LibstdcxxNoopFrame) {
+    bool Threaded = threadNoopPhiEdges(LibstdcxxNoopFrame, F);
+    CFGChanged |= Threaded;
+    Changed |= Threaded;
+    Changed |= elideNoopHandleUses(LibstdcxxNoopFrame, F, CFGChanged);
+  }
 
   NoopCoroElider NCE(F.getDataLayout(), F.getContext());
   SmallPtrSet<Instruction *, 8> DeadInsts{};
@@ -328,8 +471,9 @@ bool Lowerer::lower(Function &F) {
         II->replaceAllUsesWith(ConstantTokenNone::get(Context));
         break;
       case Intrinsic::coro_noop:
-        CFGChanged |= threadNoopPhiEdges(II);
+        CFGChanged |= threadNoopPhiEdges(II, F);
         NCE.run(II);
+        CFGChanged |= NCE.CFGChanged;
         if (!II->user_empty())
           lowerCoroNoop(II);
         break;
@@ -453,6 +597,7 @@ bool NoopCoroElider::tryEraseCallInvoke(Instruction *I) {
     eraseFromWorklist(II);
     II->getUnwindDest()->removePredecessor(II->getParent());
     II->eraseFromParent();
+    CFGChanged = true;
     return true;
   }
   return false;

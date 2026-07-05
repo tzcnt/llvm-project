@@ -10,6 +10,7 @@
 ;
 ; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=100000 -coro-elide-max-accumulated-frame-size=400000 -coro-recursive-elide-max-generations=3 | FileCheck %s
 ; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=100000 -coro-elide-max-accumulated-frame-size=400000 -coro-recursive-elide-max-generations=3 -coro-recursive-elide-inline-ramp=false | FileCheck %s --check-prefix=PINNED
+; RUN: opt < %s -S -passes='coro-recursion-stash,cgscc(coro-split),coro-recursive-elide' -coro-elide-max-frame-size=0 -coro-recursive-elide-max-generations=3 | FileCheck %s --check-prefix=SKIP
 
 ; With the fold (default): the re-entry in @f.resume allocates the block
 ; directly instead of calling the republished ramp.
@@ -25,6 +26,18 @@
 ; PINNED-NOT: call ptr @malloc(
 ; PINNED: call ptr @f(i64
 ; PINNED: call void @use(
+
+; When the frame-size cap forbids any block from being built, the member is
+; left unrepublished but the fold still applies, now targeting the original
+; ramp: the pins protect nothing once no republish can happen, and vanilla
+; clang performs exactly this inline. @f's own 32-byte frame allocation
+; appears in @f.resume in place of the outlined call.
+; SKIP-NOT: .block.
+; SKIP-LABEL: define internal void @f.resume(
+; SKIP-NOT: call ptr @f(
+; SKIP: call ptr @malloc(i64 32)
+; SKIP-NOT: call ptr @f(
+; SKIP: call void @use(
 
 define ptr @f(i64 %n) #0 {
 entry:

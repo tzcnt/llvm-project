@@ -115,12 +115,14 @@ static cl::opt<unsigned> CoroRecursiveElideMaxGenerations(
 
 static cl::opt<bool> CoroRecursiveElideInlineRamp(
     "coro-recursive-elide-inline-ramp", cl::init(true), cl::Hidden,
-    cl::desc("After republishing, inline the block ramp into the cycle "
-             "re-entry call sites in the originals' split clones. The "
-             "stash-time noinline pins only exist to keep those sites "
-             "outlined symbol references until the republish has "
-             "retargeted them; past that point the ramp is an ordinary "
-             "small function and staying outlined is pure call overhead."));
+    cl::desc("Inline each member's published ramp -- the republished "
+             "block ramp, or the original ramp when no block was built "
+             "-- into the cycle re-entry call sites in the originals' "
+             "split clones. The stash-time noinline pins only exist to "
+             "keep those sites outlined symbol references while a "
+             "republish could still retarget them; past that point the "
+             "ramp is an ordinary small function that no later inliner "
+             "will visit, and staying outlined is pure call overhead."));
 
 static cl::opt<uint64_t> CoroBulkDefaultSlots(
     "coro-elide-bulk-default-slots", cl::init(8), cl::Hidden,
@@ -1281,7 +1283,11 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
       break;
   }
 
-  if (!AnyGenerationBuilt)
+  // Even when no generation was built, the re-entry sites are still worth
+  // visiting: their pins now protect nothing, and folding the original
+  // ramp into them is exactly the inline the pins denied the CGSCC
+  // pipeline (vanilla clang performs it on every recursive coroutine).
+  if (!AnyGenerationBuilt && !CoroRecursiveElideInlineRamp)
     return false;
 
   // Republish: the top generation takes over the original's identity. Every
@@ -1311,22 +1317,23 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
   // The stash-time pins kept every cycle re-entry an outlined reference to
   // the original symbol so the RAUW above could retarget it into the block
   // ramp; a glue-inlined copy of the allocating ramp would have pinned its
-  // branch of the recursion to unelided frames forever. Republished, the
-  // block ramp is an ordinary small function, and the re-entry sites live
-  // in the originals' split clones, which no inliner visits again -- so
-  // fold the ramp into them here, as the CGSCC inliner does for ordinary
-  // split ramps. The guarded-dispatch escape legs inside the generations
-  // keep their own noinline and stay outlined.
+  // branch of the recursion to unelided frames forever. Once the republish
+  // decisions are made, each member's published ramp -- the block ramp, or
+  // the original ramp for members that never grew a block -- is an
+  // ordinary small function, and the re-entry sites live in the originals'
+  // split clones, which no inliner visits again -- so fold the ramp into
+  // them here, as the CGSCC inliner does for ordinary split ramps. The
+  // guarded-dispatch escape legs inside the generations keep their own
+  // noinline and stay outlined.
+  bool RampInlined = false;
   if (CoroRecursiveElideInlineRamp) {
-    SmallPtrSet<Function *, 4> Tops;
+    SmallPtrSet<Function *, 4> Published;
     for (unsigned I = 0; I != N; ++I)
-      if (Cur[I].Fn != Group[I].second)
-        Tops.insert(Cur[I].Fn);
+      Published.insert(Cur[I].Fn);
     for (unsigned I = 0; I != N; ++I) {
-      if (Cur[I].Fn == Group[I].second)
-        continue;
-      // The republished name is the prefix the original's clones were
-      // split under during the CGSCC pipeline.
+      // Whether republished or untouched, the member's published symbol
+      // carries the name the original's clones were split under during
+      // the CGSCC pipeline.
       StringRef Name = Cur[I].Fn->getName();
       for (StringRef Suffix : {".resume", ".destroy", ".cleanup"}) {
         Function *Clone = M.getFunction((Name + Suffix).str());
@@ -1336,14 +1343,15 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
         for (Instruction &Inst : instructions(*Clone))
           if (auto *CB = dyn_cast<CallBase>(&Inst))
             if (CB->getCalledFunction() &&
-                Tops.contains(CB->getCalledFunction()))
+                Published.contains(CB->getCalledFunction()))
               ReentrySites.push_back(CB);
         for (CallBase *CB : ReentrySites) {
           CB->removeFnAttr(llvm::Attribute::NoInline);
+          RampInlined = true;
           InlineFunctionInfo IFI;
           if (InlineFunction(*CB, IFI).isSuccess())
-            LLVM_DEBUG(dbgs() << "CoroRecursiveElide: inlined block ramp "
-                                 "re-entry in '"
+            LLVM_DEBUG(dbgs() << "CoroRecursiveElide: inlined published "
+                                 "ramp re-entry in '"
                               << Clone->getName() << "'\n");
         }
       }
@@ -1352,16 +1360,18 @@ processGroup(Module &M, ArrayRef<std::pair<Function *, Function *>> Group,
 
   // The noinline markers added at stash time have served their purpose;
   // remaining escape call sites may be inlined normally from here on.
-  for (unsigned I = 0; I != N; ++I) {
-    for (Function *Fn : {Cur[I].Fn, Group[I].second}) {
-      for (Instruction &Inst : instructions(*Fn))
-        if (auto *CB = dyn_cast<CallBase>(&Inst))
-          if (CB->getCalledFunction() &&
-              OrigIndex.contains(CB->getCalledFunction()))
-            CB->removeFnAttr(llvm::Attribute::NoInline);
+  if (AnyGenerationBuilt) {
+    for (unsigned I = 0; I != N; ++I) {
+      for (Function *Fn : {Cur[I].Fn, Group[I].second}) {
+        for (Instruction &Inst : instructions(*Fn))
+          if (auto *CB = dyn_cast<CallBase>(&Inst))
+            if (CB->getCalledFunction() &&
+                OrigIndex.contains(CB->getCalledFunction()))
+              CB->removeFnAttr(llvm::Attribute::NoInline);
+      }
     }
   }
-  return true;
+  return AnyGenerationBuilt || RampInlined;
 }
 
 PreservedAnalyses CoroRecursiveElidePass::run(Module &M,

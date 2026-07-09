@@ -397,6 +397,13 @@ struct CondParkedObject {
 /// when its boolean result reaches a branch terminator.
 struct CondConsumeInfo {
   SmallVector<CondParkedObject, 1> Objects;
+  /// Fresh temporaries of trivially-destructible linear types bound to the
+  /// call's conditional-consumer parameters. They have no tracked identity
+  /// (no CXXBindTemporaryExpr exists), and no handle a failure branch could
+  /// recover, so they are reported at the end of the analysis unless the
+  /// call's result is explicitly discharged — mirroring the maybe-unconsumed
+  /// report their non-trivial counterparts get at the temporary's dtor.
+  SmallVector<std::pair<SourceLocation, QualType>, 1> FreshTemps;
   SourceLocation CallLoc;
 };
 
@@ -832,8 +839,9 @@ public:
   /// really is consumed on only some runtime paths, and its death is
   /// diagnosed. An object that is not (any longer) Unconsumed is consumed
   /// the ordinary way, which diagnoses the double-consume at the call.
-  void registerCondConsume(const CallExpr *Call,
-                           ArrayRef<PropagationInfo> Objects) {
+  void registerCondConsume(
+      const CallExpr *Call, ArrayRef<PropagationInfo> Objects,
+      ArrayRef<std::pair<SourceLocation, QualType>> FreshTemps = {}) {
     CondConsumeInfo Info;
     Info.CallLoc = Call->getExprLoc();
     for (const PropagationInfo &PI : Objects) {
@@ -854,8 +862,64 @@ public:
       setTrackedState(
           PI, LinearInfo(LinearInfo::LS_MaybeConsumed, Call->getExprLoc()));
     }
-    if (!Info.Objects.empty())
+    Info.FreshTemps.append(FreshTemps.begin(), FreshTemps.end());
+    if (!Info.Objects.empty() || !Info.FreshTemps.empty())
       CondConsumeMap[canonicalExpr(Call)] = std::move(Info);
+  }
+
+  /// Consuming the *result* of a conditional-consumer call (or the bool
+  /// variable holding it) with a matching-tag annotated consumer discharges
+  /// the pending obligation: `tmc::consume(q.post(std::move(t)))` declares
+  /// the failure path deliberately unhandled. The parked values are marked
+  /// consumed and no branch split will occur. Returns true if a pending
+  /// obligation was discharged.
+  bool dischargeCondConsume(const Expr *Arg, StringRef Tag,
+                            SourceLocation Loc) {
+    const Stmt *Key = stripCondWrappers(Arg);
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(Key)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (!VD)
+        return false;
+      auto VIt = CondBoolVarMap.find(VD);
+      if (VIt == CondBoolVarMap.end())
+        return false;
+      Key = VIt->second;
+    }
+    auto It = CondConsumeMap.find(Key);
+    if (It == CondConsumeMap.end())
+      return false;
+    CondConsumeInfo &Info = It->second;
+    // The consumer's tag must match the parked values' linear tag.
+    QualType FirstTy = !Info.Objects.empty()
+                           ? (Info.Objects.front().Var
+                                  ? Info.Objects.front()
+                                        .Var->getType()
+                                        .getNonReferenceType()
+                                  : Info.Objects.front().Tmp->getType())
+                           : Info.FreshTemps.front().second;
+    if (!linearTagMatches(Tag, FirstTy))
+      return false;
+    for (const CondParkedObject &P : Info.Objects) {
+      PropagationInfo PI = P.Var ? PropagationInfo::makeVar(P.Var)
+                                 : PropagationInfo::makeTmp(P.Tmp);
+      std::optional<LinearInfo> Cur = trackedState(PI);
+      if (Cur && Cur->St == LinearInfo::LS_MaybeConsumed &&
+          Cur->Loc == Info.CallLoc)
+        setTrackedState(PI, LinearInfo(LinearInfo::LS_Consumed, Loc));
+    }
+    CondConsumeMap.erase(It);
+    return true;
+  }
+
+  /// Report fresh temporaries whose conditional-consumer call was never
+  /// discharged; called once after the CFG walk.
+  void reportUndischargedFreshTemps() {
+    for (const auto &Entry : CondConsumeMap) {
+      const CondConsumeInfo &Info = Entry.second;
+      for (const auto &FT : Info.FreshTemps)
+        Handler.warnMaybeNotConsumed(FT.first, StringRef(), FT.second,
+                                     Info.CallLoc, /*IsParam=*/false);
+    }
   }
 
   /// If \p Cond (a branch terminator's condition) tests the result of a
@@ -1042,7 +1106,14 @@ public:
       const ParmVarDecl *Param, const Expr *Arg,
       llvm::SmallPtrSetImpl<const VarDecl *> &ConsumedContainers,
       const LinearAttr *&StructuralElemAttr, QualType &StructuralElemTy,
-      SmallVectorImpl<PropagationInfo> *CondParked = nullptr) {
+      SmallVectorImpl<PropagationInfo> *CondParked = nullptr,
+      SmallVectorImpl<std::pair<SourceLocation, QualType>> *CondFresh =
+          nullptr) {
+    // An annotated consumer receiving the result of a pending
+    // conditional-consumer call discharges that obligation.
+    if (const auto *CA = Param->getAttr<LinearConsumerAttr>())
+      if (dischargeCondConsume(Arg, CA->getTag(), Arg->getExprLoc()))
+        return;
     PropagationInfo ArgPI = findInfo(Arg);
     if (ArgPI.isTracked()) {
       QualType ArgTy = trackedType(ArgPI);
@@ -1059,6 +1130,16 @@ public:
           StructuralElemAttr = LA;
           StructuralElemTy = ArgTy;
         }
+      return;
+    }
+    // A fresh value of a trivially-destructible linear type has no tracked
+    // identity (no CXXBindTemporaryExpr). Bound to a conditional consumer it
+    // is unrecoverable on the failure path; record it on the call's pending
+    // entry so it is reported unless the result is explicitly discharged.
+    if (ArgPI.isFresh() && !ArgPI.isFreshEmpty() && CondFresh) {
+      QualType ArgTy = Arg->getType().getNonReferenceType();
+      if (paramConsumeKind(Param, ArgTy) == ConsumeKind::AnnotatedConditional)
+        CondFresh->push_back({Arg->getExprLoc(), ArgTy});
       return;
     }
     if (ArgPI.isContainer() || ArgPI.isContainerIter()) {
@@ -1178,6 +1259,7 @@ public:
     const LinearAttr *StructuralElemAttr = nullptr;
     QualType StructuralElemTy;
     SmallVector<PropagationInfo, 1> CondParked;
+    SmallVector<std::pair<SourceLocation, QualType>, 1> CondFresh;
     // A conditional consumer with a non-bool result cannot be tested;
     // fall back to unconditional consumption at the binding.
     bool ResultTestable = Call->getType()->isBooleanType();
@@ -1188,12 +1270,13 @@ public:
       handleArgumentBinding(FunD->getParamDecl(Index - Offset),
                             Call->getArg(Index), ConsumedContainers,
                             StructuralElemAttr, StructuralElemTy,
-                            ResultTestable ? &CondParked : nullptr);
+                            ResultTestable ? &CondParked : nullptr,
+                            ResultTestable ? &CondFresh : nullptr);
     }
     for (const VarDecl *Root : ConsumedContainers)
       consumeContainer(Root, Call->getExprLoc());
-    if (!CondParked.empty())
-      registerCondConsume(Call, CondParked);
+    if (!CondParked.empty() || !CondFresh.empty())
+      registerCondConsume(Call, CondParked, CondFresh);
 
     if (!ObjArg)
       return;
@@ -1372,10 +1455,18 @@ public:
       const auto *DRE =
           dyn_cast<DeclRefExpr>(canonicalExpr(BO->getLHS())->IgnoreImplicit());
       const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
-      // Reassigning a bool that captured a conditional-consumer result ends
-      // that association.
-      if (VD)
+      // Assigning a conditional-consumer call's result into a bool variable
+      // (re)binds the variable to that call (`ok = tok.post(...)`, reusing a
+      // flag declared earlier); assigning anything else ends any prior
+      // association.
+      if (VD) {
         CondBoolVarMap.erase(VD);
+        if (VD->getType()->isBooleanType()) {
+          const Stmt *Key = stripCondWrappers(BO->getRHS());
+          if (CondConsumeMap.count(Key))
+            CondBoolVarMap[VD] = Key;
+        }
+      }
       // Storing a derived pointer into a local pointer variable keeps the
       // handle visible; storing it anywhere else escapes the container.
       PropagationInfo RHSPI = findInfo(BO->getRHS());
@@ -2166,6 +2257,10 @@ public:
     }
 
     CurrStates = nullptr;
+
+    // Fresh temporaries of trivially-destructible linear types bound to
+    // conditional consumers whose result was never explicitly discharged.
+    Visitor.reportUndischargedFreshTemps();
 
     // Path-insensitive backstop for containers filled inside loops, which
     // the single-pass dataflow cannot see at the loop exit.

@@ -3954,6 +3954,19 @@ diagnosed. If the result is never tested, the value counts as consumed on
 only some paths, which is diagnosed when it dies. A ``conditional`` consumer
 that does not return ``bool`` consumes unconditionally, as if the mode were
 absent.
+
+Passing the call's result (or the ``bool`` variable holding it) to a
+matching-tag ``linear_consumer``-annotated parameter *discharges* the
+pending obligation — the escape hatch for callers that know the failure
+path is unreachable and deliberately ignore the result:
+
+.. code-block:: c++
+
+  consume(token.post(std::move(t))); // failure deliberately unhandled
+
+A fresh temporary of a trivially-destructible linear type bound to a
+conditional consumer (``token.post(make_task())``) is always diagnosed
+unless so discharged: no handle exists that a failure branch could recover.
   }];
 }
 

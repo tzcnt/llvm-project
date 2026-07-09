@@ -700,3 +700,60 @@ void err_cond_eq_true_drop(Chan &c) {
   if (c.post(std::move(t)) == true) { // expected-note {{consumed here}}
   }
 } // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+
+// A flag variable may be reused: assigning a new conditional-consumer call
+// result into it rebinds the association.
+void ok_cond_bool_var_rebound(Chan &c) {
+  Tok t1 = make();
+  bool ok = c.post(std::move(t1));
+  if (!ok)
+    t1.finish();
+  Tok t2 = make();
+  ok = c.post(std::move(t2));
+  if (ok == false)
+    t2.finish();
+}
+
+// Escape hatch: consuming the *result* of a conditional-consumer call (or
+// the bool variable holding it) with a matching-tag annotated consumer
+// discharges the pending obligation — for callers that know the failure
+// path is unreachable and deliberately ignore the result.
+template <typename... A> void discharge([[clang::linear_consumer("tok")]] A &&...);
+template <typename... A> void discharge_triv([[clang::linear_consumer("trivial")]] A &&...);
+template <typename... A> void discharge_other([[clang::linear_consumer("other")]] A &&...);
+
+void ok_cond_discharge_named(Chan &c) {
+  Tok t = make();
+  discharge(c.post(std::move(t)));
+}
+void ok_cond_discharge_temp(Chan &c) { discharge(c.post(make())); }
+void ok_cond_discharge_bool_var(Chan &c) {
+  Tok t = make();
+  bool ok = c.post(std::move(t));
+  discharge(ok);
+}
+// A consumer with a non-matching tag does not discharge.
+void err_cond_discharge_wrong_tag(Chan &c) {
+  Tok t = make();
+  discharge_other(c.post(std::move(t))); // expected-note {{consumed here}}
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+
+// A fresh temporary of a *trivially-destructible* linear type bound to a
+// conditional consumer has no tracked identity (no CXXBindTemporaryExpr)
+// and no handle a failure branch could recover; it is reported even when
+// the result is branched on, unless the result is explicitly discharged.
+// This mirrors the maybe-unconsumed report that a temporary with a
+// destructor gets at its dtor.
+struct ChanTriv {
+  bool post([[clang::linear_consumer("trivial", conditional)]] Triv &&t);
+};
+void err_cond_triv_temp(ChanTriv &c) {
+  c.post(make_triv()); // expected-error {{temporary of linear type 'Triv' is not consumed on every control-flow path}} expected-note {{consumed here}}
+}
+void err_cond_triv_temp_branched(ChanTriv &c) {
+  if (!c.post(make_triv())) { // expected-error {{temporary of linear type 'Triv' is not consumed on every control-flow path}} expected-note {{consumed here}}
+  }
+}
+void ok_cond_triv_temp_discharged(ChanTriv &c) {
+  discharge_triv(c.post(make_triv()));
+}

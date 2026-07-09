@@ -60,6 +60,7 @@
 #include "llvm/IR/Value.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,6 +68,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CallGraphUpdater.h"
+#include "llvm/Transforms/Utils/CallPromotionUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <cassert>
@@ -79,6 +81,11 @@ using namespace llvm;
 
 #define DEBUG_TYPE "coro-split"
 
+static cl::opt<bool> DevirtSelfDestroy(
+    "coro-split-devirt-self-destroy", cl::Hidden, cl::init(true),
+    cl::desc("Speculatively devirtualize a coroutine's destruction of its own "
+             "frame against the destroy/cleanup clones created by CoroSplit"));
+
 // FIXME:
 // Lower the intrinisc in CoroEarly phase if coroutine frame doesn't escape
 // and it is known that other transformations, for example, sanitizers
@@ -88,6 +95,9 @@ static void lowerAwaitSuspend(IRBuilder<> &Builder, CoroAwaitSuspendInst *CB,
   auto Wrapper = CB->getWrapperFunction();
   auto Awaiter = CB->getAwaiter();
   auto FramePtr = CB->getFrame();
+
+  if (!llvm::is_contained(Shape.AwaitSuspendWrappers, Wrapper))
+    Shape.AwaitSuspendWrappers.push_back(Wrapper);
 
   Builder.SetInsertPoint(CB);
 
@@ -1363,6 +1373,80 @@ static void simplifySuspendPoints(coro::Shape &Shape) {
   }
 }
 
+// A coroutine that destroys its own handle when it finishes (a common final
+// awaiter pattern) does so through the frame's destroy slot, an indirect call
+// no later pass can resolve: the slot is ordinary mutable memory and the
+// initializing store is in whichever function created this frame instance.
+// However, the switch ABI only ever stores two functions in the slot, and
+// both are the clones created right here: the destroy clone (heap-allocated
+// frames) and the cleanup clone (frames whose allocation CoroElide folds
+// into a caller). Speculatively devirtualize such calls with
+// compare-and-branch dispatch over those two candidates, keeping the
+// original indirect call as the fallthrough. This exposes the callee bodies
+// to the inliner: an empty cleanup vanishes entirely, and destroy typically
+// reduces to a direct call to the deallocation function.
+static void devirtualizeSelfDestroys(const coro::Shape &Shape,
+                                     Function *ResumeClone,
+                                     Function *DestroyClone,
+                                     Function *CleanupClone) {
+  if (!DevirtSelfDestroy)
+    return;
+
+  SmallVector<CallBase *, 2> Sites;
+  auto CollectSites = [&](Function *F, Value *FramePtr) {
+    for (Instruction &I : instructions(*F)) {
+      auto *SubFn = dyn_cast<CoroSubFnInst>(&I);
+      if (!SubFn || SubFn->getIndex() != CoroSubFnInst::DestroyIndex ||
+          SubFn->getFrame()->stripPointerCasts() != FramePtr)
+        continue;
+      for (User *U : SubFn->users())
+        if (auto *CB = dyn_cast<CallBase>(U))
+          // A nomerge call through the subfn is the residual indirect arm of
+          // an earlier promotion (e.g. when the same wrapper is reached again
+          // while splitting a no-alloc variant); don't promote it again.
+          if (CB->getCalledOperand() == SubFn && !CB->isMustTailCall() &&
+              !CB->hasFnAttr(Attribute::NoMerge))
+            Sites.push_back(CB);
+    }
+  };
+
+  // The destroy-through-own-handle usually sits in an await_suspend wrapper
+  // (whose second parameter is this coroutine's frame), which is inlined into
+  // the resume clone only after splitting. It can also appear in the resume
+  // clone directly (as the frame argument) once the wrapper has been inlined
+  // or when the frontend emitted the awaiter inline.
+  CollectSites(ResumeClone, &*ResumeClone->arg_begin());
+  for (Function *Wrapper : Shape.AwaitSuspendWrappers) {
+    if (Wrapper->arg_size() != 2)
+      continue;
+    // The frontend does not stamp target attributes on await_suspend
+    // wrappers. They are only ever inlined into this coroutine's functions,
+    // so give them the clones' target attributes; without them call
+    // promotion would reject the direct arms as feature-incompatible.
+    for (StringRef AttrName : {"target-cpu", "target-features", "tune-cpu"})
+      if (!Wrapper->hasFnAttribute(AttrName) &&
+          ResumeClone->hasFnAttribute(AttrName))
+        Wrapper->addFnAttr(ResumeClone->getFnAttribute(AttrName));
+    CollectSites(Wrapper, Wrapper->getArg(1));
+  }
+
+  for (CallBase *CB : Sites) {
+    // The promoted arms differ from the fallthrough only in their callee.
+    // Without nomerge, SimplifyCFG's sinking would merge them back into a
+    // single call whose callee is a phi that then folds back to the loaded
+    // pointer, undoing the promotion before the callees can be inlined.
+    CB->addFnAttr(Attribute::NoMerge);
+    // An elided frame has nothing to deallocate, so its cleanup path is the
+    // cheapest; test it first.
+    if (isLegalToPromote(*CB, CleanupClone))
+      promoteCallWithIfThenElse(*CB, CleanupClone).addFnAttr(
+          Attribute::NoMerge);
+    if (isLegalToPromote(*CB, DestroyClone))
+      promoteCallWithIfThenElse(*CB, DestroyClone).addFnAttr(
+          Attribute::NoMerge);
+  }
+}
+
 namespace {
 
 struct SwitchCoroutineSplitter {
@@ -1388,6 +1472,8 @@ struct SwitchCoroutineSplitter {
 
     // Store addresses resume/destroy/cleanup functions in the coroutine frame.
     updateCoroFrame(Shape, ResumeClone, DestroyClone, CleanupClone);
+
+    devirtualizeSelfDestroys(Shape, ResumeClone, DestroyClone, CleanupClone);
 
     assert(Clones.empty());
     Clones.push_back(ResumeClone);

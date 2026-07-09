@@ -59,6 +59,10 @@ struct Shape {
   SmallVector<AnyCoroSuspendInst *, 4> CoroSuspends;
   SmallVector<CoroAwaitSuspendInst *, 4> CoroAwaitSuspends;
   SmallVector<CallInst *, 2> SymmetricTransfers;
+  // await_suspend wrapper functions called from this coroutine, recorded when
+  // the coro.await.suspend intrinsics are lowered. Their second parameter is
+  // this coroutine's frame.
+  SmallVector<Function *, 2> AwaitSuspendWrappers;
 
   // Values invalidated by replaceSwiftErrorOps()
   SmallVector<CallInst *, 2> SwiftErrorOps;
@@ -72,6 +76,7 @@ struct Shape {
     CoroSuspends.clear();
     CoroAwaitSuspends.clear();
     SymmetricTransfers.clear();
+    AwaitSuspendWrappers.clear();
 
     SwiftErrorOps.clear();
 

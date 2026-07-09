@@ -22,6 +22,14 @@
 //     syntactically move the object, e.g. `.detach()`, are modeled),
 //   - returning it from the function.
 //
+// Because binding an argument to a by-value or rvalue-reference parameter
+// consumes it in the caller, the callee inherits the consumption obligation:
+// such parameters start the function in the Unconsumed state and must
+// themselves be consumed on every path. Deliberate (lenient) exceptions:
+// unnamed parameters (an explicit drop), const-qualified parameters (cannot
+// be consumed at all), and member functions of the linear class itself
+// (whose special members manipulate raw fields of other instances).
+//
 // std::move / std::forward and fluent member functions that return a
 // reference to the same linear class are treated as transparent
 // pass-throughs.
@@ -41,6 +49,7 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ParentMap.h"
@@ -75,8 +84,22 @@ LinearityWarningsHandlerBase::~LinearityWarningsHandlerBase() = default;
 static const LinearAttr *getLinearAttr(QualType QT) {
   if (QT.isNull())
     return nullptr;
-  if (const CXXRecordDecl *RD = QT->getAsCXXRecordDecl())
-    return RD->getAttr<LinearAttr>();
+  const CXXRecordDecl *RD = QT->getAsCXXRecordDecl();
+  if (!RD)
+    return nullptr;
+  if (const LinearAttr *LA = RD->getAttr<LinearAttr>())
+    return LA;
+  // A class template specialization only receives the pattern's attributes
+  // when it is instantiated, but a specialization can be named without ever
+  // being completed (e.g. a do-nothing function taking Spec&&: neither the
+  // reference parameter nor the empty body requires a complete type). Read
+  // the attribute from the primary template's pattern so such parameters
+  // are still armed.
+  if (const auto *Spec = dyn_cast<ClassTemplateSpecializationDecl>(RD))
+    if (!Spec->hasDefinition() &&
+        Spec->getSpecializationKind() == TSK_Undeclared)
+      if (const ClassTemplateDecl *CTD = Spec->getSpecializedTemplate())
+        return CTD->getTemplatedDecl()->getAttr<LinearAttr>();
   return nullptr;
 }
 
@@ -122,6 +145,41 @@ static bool isPassThroughCall(const CallExpr *Call) {
   default:
     return false;
   }
+}
+
+/// Does \p Param transfer a consumption obligation into \p FD's body?
+/// True for named, non-const parameters of linear type taken by value or by
+/// rvalue reference: the caller-side rules treat binding an argument to such
+/// a parameter as consumption, so the callee inherits the obligation.
+/// Deliberate escape hatches (all lenient): an unnamed parameter is an
+/// explicit drop, a const-qualified parameter cannot be consumed at all, and
+/// member functions of the linear class itself (move constructor, move
+/// assignment, ...) manipulate raw fields of other instances rather than
+/// consuming them.
+static bool paramRequiresConsumption(const FunctionDecl *FD,
+                                     const ParmVarDecl *Param) {
+  QualType Ty = Param->getType();
+  if (Ty->isRValueReferenceType())
+    Ty = Ty->getPointeeType();
+  else if (Ty->isReferenceType())
+    return false;
+  if (Ty.isConstQualified() || !isLinearType(Ty))
+    return false;
+  // A parameter annotated [[clang::linear_consumer]] declares that the
+  // obligation is discharged at this call boundary: the caller consumes the
+  // argument at the call site, and the callee is trusted, not tracked. The
+  // value's onward path (e.g. binding into a reference member of a wrapper
+  // under construction) need not be provable to the analysis.
+  if (const auto *CA = Param->getAttr<LinearConsumerAttr>())
+    if (linearTagMatches(CA->getTag(), Ty))
+      return false;
+  if (!Param->getIdentifier())
+    return false;
+  if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+    if (const CXXRecordDecl *RD = Ty->getAsCXXRecordDecl())
+      if (MD->getParent()->getCanonicalDecl() == RD->getCanonicalDecl())
+        return false;
+  return true;
 }
 
 static SourceLocation getLastStmtLoc(const CFGBlock *Block) {
@@ -478,16 +536,18 @@ public:
       setTrackedState(PI, LinearInfo(LinearInfo::LS_Consumed, Loc));
   }
 
-  /// If \p E refers to a local (non-parameter, non-reference) variable of
-  /// linear type, return it as a trackable target, even if it is not
-  /// currently tracked. Used to start tracking a variable when a value is
-  /// stored into it (assignment, producer methods).
+  /// If \p E refers to a local (non-reference) variable of linear type,
+  /// return it as a trackable target, even if it is not currently tracked.
+  /// Used to start tracking a variable when a value is stored into it
+  /// (assignment, producer methods). By-value parameters qualify: they are
+  /// tracked from function entry, and re-arming after consumption follows
+  /// the same rules as for ordinary locals.
   PropagationInfo localVarTarget(const Expr *E) const {
     const auto *DRE = dyn_cast<DeclRefExpr>(canonicalExpr(E)->IgnoreImplicit());
     if (!DRE)
       return {};
     const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-    if (!VD || isa<ParmVarDecl>(VD) || !VD->hasLocalStorage() ||
+    if (!VD || !VD->hasLocalStorage() ||
         VD->getType()->isReferenceType() || !isLinearType(VD->getType()))
       return {};
     return PropagationInfo::makeVar(VD);
@@ -612,7 +672,7 @@ public:
       return;
     }
     Handler.warnNeverConsumed(E->getExprLoc(), StringRef(), E->getType(),
-                              E->getExprLoc());
+                              E->getExprLoc(), /*IsParam=*/false);
   }
 
   //===--------------------------------------------------------------------===//
@@ -880,6 +940,22 @@ public:
   void VisitCoawaitExpr(const CoawaitExpr *E) { VisitCoroutineSuspendExpr(E); }
   void VisitCoyieldExpr(const CoyieldExpr *E) { VisitCoroutineSuspendExpr(E); }
 
+  /// A constructor initializing a reference member from a tracked object
+  /// escapes it: ownership is handed to whoever later consumes through the
+  /// reference. (E.g. wrapper awaitables whose type parameter is deduced as
+  /// an rvalue reference store the reference in a member and consume through
+  /// it in await_suspend.) Non-reference members need no handling here: the
+  /// member's constructor is linearized as its own CFG element and consumes
+  /// per the usual rules.
+  void handleCtorInitializer(const CXXCtorInitializer *CI) {
+    if (!CI->isAnyMemberInitializer())
+      return;
+    if (!CI->getAnyMember()->getType()->isReferenceType())
+      return;
+    if (const Expr *Init = CI->getInit())
+      escapeObject(findInfo(Init));
+  }
+
   //===--------------------------------------------------------------------===//
   // Object death
   //===--------------------------------------------------------------------===//
@@ -888,14 +964,15 @@ public:
     std::optional<LinearInfo> Info = trackedState(PI);
     if (!Info)
       return;
+    bool IsParam = PI.isVar() && isa<ParmVarDecl>(PI.getVar());
     switch (Info->St) {
     case LinearInfo::LS_Unconsumed:
       Handler.warnNeverConsumed(Loc, trackedName(PI), trackedType(PI),
-                                Info->Loc);
+                                Info->Loc, IsParam);
       break;
     case LinearInfo::LS_MaybeConsumed:
       Handler.warnMaybeNotConsumed(Loc, trackedName(PI), trackedType(PI),
-                                   Info->Loc);
+                                   Info->Loc, IsParam);
       break;
     case LinearInfo::LS_Consumed:
       break;
@@ -934,6 +1011,15 @@ public:
 
     BlockInfo = LinearBlockInfo(CFGraph->getNumBlockIDs(), SortedGraph);
     CurrStates = std::make_unique<LinearStateMap>();
+
+    // Parameters received by value or by rvalue reference were consumed in
+    // the caller by the call expression itself; the consumption obligation
+    // transfers to this function. Arm them at entry.
+    for (const ParmVarDecl *Param : D->parameters())
+      if (paramRequiresConsumption(D, Param))
+        CurrStates->setState(
+            Param, LinearInfo(LinearInfo::LS_Unconsumed, Param->getLocation()));
+
     LinearityStmtVisitor Visitor(Handler, AC.getParentMap(),
                                  CurrStates.get());
 
@@ -951,6 +1037,11 @@ public:
         case CFGElement::Constructor:
         case CFGElement::CXXRecordTypedCall:
           Visitor.Visit(B.castAs<CFGStmt>().getStmt());
+          break;
+
+        case CFGElement::Initializer:
+          Visitor.handleCtorInitializer(
+              B.castAs<CFGInitializer>().getInitializer());
           break;
 
         case CFGElement::TemporaryDtor: {
@@ -976,6 +1067,16 @@ public:
         default:
           break;
         }
+      }
+
+      // A block containing a no-return call (assert failure handler,
+      // std::abort, ...) jumps straight to the exit block in the CFG, but
+      // the program terminates on that path: tracked objects are not leaked
+      // there. Do not let its state flow into the exit merge, where it would
+      // demote values consumed on all returning paths to MaybeConsumed.
+      if (CurrBlock->hasNoReturnElement()) {
+        CurrStates = nullptr;
+        continue;
       }
 
       // At the exit block, report any tracked object that is still (maybe)
@@ -1019,22 +1120,25 @@ private:
     for (const auto &Entry : CurrStates->VarMap) {
       const VarDecl *Var = Entry.first;
       const LinearInfo &Info = Entry.second;
+      bool IsParam = isa<ParmVarDecl>(Var);
+      QualType Ty = Var->getType().getNonReferenceType();
       if (Info.St == LinearInfo::LS_Unconsumed)
-        Handler.warnNeverConsumed(Var->getLocation(), varName(Var),
-                                  Var->getType(), Info.Loc);
+        Handler.warnNeverConsumed(Var->getLocation(), varName(Var), Ty,
+                                  Info.Loc, IsParam);
       else if (Info.St == LinearInfo::LS_MaybeConsumed)
-        Handler.warnMaybeNotConsumed(Var->getLocation(), varName(Var),
-                                     Var->getType(), Info.Loc);
+        Handler.warnMaybeNotConsumed(Var->getLocation(), varName(Var), Ty,
+                                     Info.Loc, IsParam);
     }
     for (const auto &Entry : CurrStates->TmpMap) {
       const CXXBindTemporaryExpr *Tmp = Entry.first;
       const LinearInfo &Info = Entry.second;
       if (Info.St == LinearInfo::LS_Unconsumed)
         Handler.warnNeverConsumed(Tmp->getExprLoc(), StringRef(),
-                                  Tmp->getType(), Info.Loc);
+                                  Tmp->getType(), Info.Loc, /*IsParam=*/false);
       else if (Info.St == LinearInfo::LS_MaybeConsumed)
         Handler.warnMaybeNotConsumed(Tmp->getExprLoc(), StringRef(),
-                                     Tmp->getType(), Info.Loc);
+                                     Tmp->getType(), Info.Loc,
+                                     /*IsParam=*/false);
     }
   }
 };
@@ -1049,6 +1153,14 @@ bool clang::linearity::functionUsesLinearTypes(const Decl *D) {
   const Stmt *Body = D->getBody();
   if (!Body)
     return false;
+
+  // A parameter carrying a consumption obligation makes the function worth
+  // analyzing even if the body never mentions a linear type (e.g. an empty
+  // body that leaks the parameter).
+  if (const auto *FD = dyn_cast<FunctionDecl>(D))
+    for (const ParmVarDecl *Param : FD->parameters())
+      if (paramRequiresConsumption(FD, Param))
+        return true;
 
   SmallVector<const Stmt *, 32> Worklist;
   Worklist.push_back(Body);

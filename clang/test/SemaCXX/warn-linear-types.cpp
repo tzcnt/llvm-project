@@ -173,3 +173,135 @@ void err_triv_discard() {
 void err_triv_discard_void_cast() {
   (void)make_triv(); // expected-error {{temporary of linear type 'Triv' is never consumed}}
 }
+
+// Parameters: binding an argument to a by-value or rvalue-reference
+// parameter consumes it in the caller, so the callee inherits the
+// consumption obligation and must consume (or return) the parameter on
+// every path. Lenient exceptions: unnamed parameters (an explicit drop),
+// const-qualified parameters (cannot be consumed), lvalue-reference
+// parameters (the caller retains ownership), and member functions of the
+// linear class itself (whose special members manipulate raw fields of
+// other instances).
+void ok_param_sink(Tok t) { sink(std::move(t)); }
+void ok_param_finish(Tok t) { t.finish(); }
+Tok ok_param_return(Tok t) { return t; }
+void ok_param_rref(Tok &&t) { sink_rref(std::move(t)); }
+Tok ok_param_rref_return(Tok &&t) { return std::move(t); }
+void ok_param_lref(Tok &t) {}
+void ok_param_cref(const Tok &t) {}
+void ok_param_unnamed(Tok) {}
+void ok_param_const_val(const Tok t) {}
+void ok_param_reassign(Tok t) {
+  t.finish();
+  t = make();
+  t.finish();
+}
+
+// A path that provably does not return (assert failure handlers, abort)
+// terminates the program rather than leaking the value; it must not demote
+// values consumed on all returning paths.
+[[noreturn]] void die();
+void ok_param_noreturn_path(Tok t, bool c) {
+  if (c)
+    die();
+  t.finish();
+}
+void ok_local_noreturn_path(bool c) {
+  Tok t = make();
+  if (c)
+    die();
+  sink(std::move(t));
+}
+
+// A constructor consuming its parameter in a member initializer.
+struct ParamWrapper {
+  Tok inner;
+  ParamWrapper(Tok &&t) : inner(std::move(t)) {}
+};
+
+// Initializing a reference member from a linear value escapes it: ownership
+// is handed to whoever later consumes through the reference (e.g. wrapper
+// awaitables whose type parameter is deduced as an rvalue reference).
+struct RefWrapper {
+  Tok &&inner;
+  RefWrapper(Tok &&t) : inner(static_cast<Tok &&>(t)) {}
+};
+void ok_ref_member_escape() {
+  Tok t = make();
+  RefWrapper w(std::move(t));
+  w.inner.finish();
+}
+
+// Member functions of the linear class itself are exempt.
+struct [[clang::linear("tok2")]] Tok2 {
+  int h;
+  Tok2(Tok2 &&o) : h(o.h) { o.h = 0; }
+  Tok2 &operator=(Tok2 &&o) {
+    h = o.h;
+    o.h = 0;
+    return *this;
+  }
+  [[clang::linear_consumer("tok2")]] void finish();
+};
+
+void err_param_leak(Tok t) {} // expected-error {{linear parameter 't' of type 'Tok' is never consumed}}
+void err_param_rref_leak(Tok &&t) {} // expected-error {{linear parameter 't' of type 'Tok' is never consumed}}
+
+void err_param_branch(Tok t, bool c) { // expected-error {{linear parameter 't' of type 'Tok' is not consumed on every control-flow path}}
+  if (c)
+    t.finish(); // expected-note {{consumed here}}
+}
+
+void err_param_double_consume(Tok t) {
+  t.finish(); // expected-note {{consumed here}}
+  t.finish(); // expected-error {{linear variable 't' of type 'Tok' is used after being consumed}}
+}
+
+struct BadParamWrapper {
+  int x;
+  BadParamWrapper(Tok &&t) : x(0) {} // expected-error {{linear parameter 't' of type 'Tok' is never consumed}}
+};
+
+void err_triv_param_leak(Triv t) {} // expected-error {{linear parameter 't' of type 'Triv' is never consumed}}
+
+// linear_consumer in parameter position: the obligation is discharged at
+// the call boundary. The caller consumes the argument at the call site; the
+// callee is trusted, not tracked — even a body that visibly drops or only
+// conditionally forwards the value is accepted.
+void boundary_sink([[clang::linear_consumer("tok")]] Tok &&t) {}
+void boundary_cond([[clang::linear_consumer("tok")]] Tok &&t, bool c) {
+  if (c)
+    sink(std::move(t));
+}
+void ok_boundary_caller(bool c) {
+  Tok t = make();
+  boundary_cond(std::move(t), c);
+}
+void err_boundary_double() {
+  Tok t = make();
+  boundary_sink(std::move(t)); // expected-note {{consumed here}}
+  boundary_sink(std::move(t)); // expected-error {{linear variable 't' of type 'Tok' is used after being consumed}}
+}
+
+// An annotated lvalue-reference parameter also consumes at the call site (a
+// capability the structural rvalue-reference rule does not provide).
+void lref_consume([[clang::linear_consumer("tok")]] Tok &t);
+void ok_lref_consumer() {
+  Tok t = make();
+  lref_consume(t);
+}
+void err_lref_consumer_double() {
+  Tok t = make();
+  lref_consume(t); // expected-note {{consumed here}}
+  lref_consume(t); // expected-error {{linear variable 't' of type 'Tok' is used after being consumed}}
+}
+
+// A parameter whose type is a class template specialization that is never
+// instantiated (a reference parameter and an empty body require no complete
+// type) must still be armed: the linear attribute is read from the primary
+// template's pattern.
+template <typename T> struct [[clang::linear("tpl")]] TplTok {
+  T x;
+  [[clang::linear_consumer("tpl")]] void finish();
+};
+void err_uninstantiated_spec_param(TplTok<int> &&t) {} // expected-error {{linear parameter 't' of type 'TplTok<int>' is never consumed}}

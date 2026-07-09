@@ -12,6 +12,9 @@
 // exactly once on every control-flow path; consuming operations are moves,
 // binding to rvalue-reference or by-value parameters, calls to member
 // functions marked [[clang::linear_consumer]], and returning the value.
+// Because argument binding consumes in the caller, by-value and
+// rvalue-reference parameters of linear type carry the consumption
+// obligation into the callee and are tracked from function entry.
 //
 //===----------------------------------------------------------------------===//
 
@@ -41,14 +44,18 @@ public:
   virtual void emitDiagnostics() {}
 
   /// A linear object is destroyed (or reaches the end of the function)
-  /// without ever having been consumed.
+  /// without ever having been consumed. \p IsParam is true when the object
+  /// is a function parameter whose consumption obligation was received from
+  /// the caller.
   virtual void warnNeverConsumed(SourceLocation Loc, StringRef Name,
-                                 QualType Ty, SourceLocation CreatedLoc) {}
+                                 QualType Ty, SourceLocation CreatedLoc,
+                                 bool IsParam) {}
 
   /// A linear object is destroyed but was only consumed on some of the
   /// control-flow paths that reach the destruction point.
   virtual void warnMaybeNotConsumed(SourceLocation Loc, StringRef Name,
-                                    QualType Ty, SourceLocation ConsumedLoc) {}
+                                    QualType Ty, SourceLocation ConsumedLoc,
+                                    bool IsParam) {}
 
   /// A linear object is consumed (or otherwise used as a consumable value)
   /// after it has (\p Maybe: may have) already been consumed. This covers

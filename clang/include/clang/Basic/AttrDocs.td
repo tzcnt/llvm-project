@@ -3878,11 +3878,20 @@ control-flow path. Consuming a value means one of:
 * calling a member function marked ``clang::linear_consumer`` on it,
 * returning it from the enclosing function.
 
+Because binding an argument to a by-value or rvalue-reference parameter
+consumes it in the caller, such parameters carry the consumption obligation
+into the callee: they are tracked from function entry and must themselves be
+consumed (or returned) on every path. Exceptions: unnamed parameters (an
+explicit drop), const-qualified parameters (which cannot be consumed), and
+parameters of member functions of the linear class itself (whose special
+members manipulate raw fields of other instances).
+
 The analysis is flow-sensitive and intra-procedural, and reports (by default
 as errors, controllable with ``-Wlinear``):
 
-* a local variable or temporary of linear type that is destroyed, or reaches
-  the end of the function, without having been consumed,
+* a local variable, parameter, or temporary of linear type that is
+  destroyed, or reaches the end of the function, without having been
+  consumed,
 * a value that is consumed a second time (this also catches use-after-move),
 * an assignment that overwrites a still-unconsumed linear value,
 * a value whose consumption state differs between loop iterations.
@@ -3915,6 +3924,15 @@ Note that binding a linear value to an rvalue-reference or by-value parameter
 of *any* function already consumes it without annotation; this attribute is
 needed for member functions that consume ``*this`` (which an ordinary call
 does not imply), and to document designated consuming APIs.
+
+On a parameter, the annotation additionally declares that the consumption
+obligation is *discharged at the call boundary*: the parameter is exempt from
+the callee-side tracking that by-value and rvalue-reference parameters of
+linear type otherwise receive, so the value's onward path inside the callee
+(for example, binding into a reference member of an object under
+construction) need not be provable to the analysis. An annotated
+lvalue-reference parameter also consumes its argument, which the structural
+rules alone never do.
   }];
 }
 

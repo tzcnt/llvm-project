@@ -2456,23 +2456,25 @@ public:
   }
 
   void warnNeverConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
-                         SourceLocation CreatedLoc) override {
+                         SourceLocation CreatedLoc, bool IsParam) override {
     PartialDiagnosticAt Warning(
         Loc, Name.empty()
                  ? S.PDiag(diag::warn_linear_temp_never_consumed) << Ty
-                 : S.PDiag(diag::warn_linear_var_never_consumed) << Name
-                       << Ty);
+                 : S.PDiag(diag::warn_linear_var_never_consumed)
+                       << Name << Ty << (IsParam ? 1 : 0));
     addDiagWithNote(std::move(Warning), CreatedLoc,
-                    diag::note_linear_created_here);
+                    IsParam ? diag::note_linear_param_declared_here
+                            : diag::note_linear_created_here);
   }
 
   void warnMaybeNotConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
-                            SourceLocation ConsumedLoc) override {
+                            SourceLocation ConsumedLoc,
+                            bool IsParam) override {
     PartialDiagnosticAt Warning(
         Loc, Name.empty()
                  ? S.PDiag(diag::warn_linear_temp_maybe_unconsumed) << Ty
-                 : S.PDiag(diag::warn_linear_var_maybe_unconsumed) << Name
-                       << Ty);
+                 : S.PDiag(diag::warn_linear_var_maybe_unconsumed)
+                       << Name << Ty << (IsParam ? 1 : 0));
     addDiagWithNote(std::move(Warning), ConsumedLoc,
                     diag::note_linear_consumed_here);
   }

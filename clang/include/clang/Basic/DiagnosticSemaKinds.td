@@ -4505,6 +4505,41 @@ def warn_param_typestate_mismatch : Warning<
   "argument not in expected state; expected '%0', observed '%1'">,
   InGroup<Consumed>, DefaultIgnore;
 
+// Linear type warnings (-Wlinear); these default to errors.
+def warn_linear_var_never_consumed : Warning<
+  "linear variable '%0' of type %1 is never consumed; it must be consumed "
+  "exactly once (moved, awaited, or passed to a consuming operation)">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_temp_never_consumed : Warning<
+  "temporary of linear type %0 is never consumed; it must be consumed "
+  "exactly once (moved, awaited, or passed to a consuming operation)">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_var_maybe_unconsumed : Warning<
+  "linear variable '%0' of type %1 is not consumed on every control-flow "
+  "path">, InGroup<LinearType>, DefaultError;
+def warn_linear_temp_maybe_unconsumed : Warning<
+  "temporary of linear type %0 is not consumed on every control-flow path">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_var_already_consumed : Warning<
+  "linear variable '%0' of type %1 is %select{|potentially }2used after "
+  "being consumed">, InGroup<LinearType>, DefaultError;
+def warn_linear_temp_already_consumed : Warning<
+  "temporary of linear type %0 is %select{|potentially }1used after being "
+  "consumed">, InGroup<LinearType>, DefaultError;
+def warn_linear_assign_discards : Warning<
+  "assignment to linear variable '%0' of type %1 discards a value that has "
+  "not been consumed">, InGroup<LinearType>, DefaultError;
+def warn_linear_loop_state_mismatch : Warning<
+  "linear consumption state of variable '%0' differs between loop "
+  "iterations; a linear value must be consumed exactly once">,
+  InGroup<LinearType>, DefaultError;
+def note_linear_created_here : Note<"value created here">;
+def note_linear_consumed_here : Note<"consumed here">;
+def warn_linear_consumer_tag_mismatch : Warning<
+  "'linear_consumer' attribute on %0 does not consume anything: %select{its "
+  "tag does not match the 'linear' attribute tag on class %2|class %2 has no "
+  "'linear' attribute}1">, InGroup<LinearType>;
+
 // no_sanitize attribute
 def warn_unknown_sanitizer_ignored : Warning<
   "unknown sanitizer '%0' ignored">, InGroup<UnknownSanitizers>;

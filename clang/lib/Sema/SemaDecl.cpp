@@ -17092,9 +17092,12 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
           getDiagnostics().getSuppressAllDiagnostics()) {
         DiscardCleanupsInEvaluationContext();
       }
-      if (!hasUncompilableErrorOccurred() && !isa<FunctionTemplateDecl>(dcl)) {
-        // Since the body is valid, issue any analysis-based warnings that are
-        // enabled.
+      if (!isa<FunctionTemplateDecl>(dcl)) {
+        // Issue any analysis-based warnings that are enabled. If an
+        // uncompilable error has occurred, IssueWarnings only flushes the
+        // possibly-unreachable diagnostics and runs the linearity analysis
+        // (whose diagnostics are errors by default and must not be masked by
+        // errors in other functions); all other analyses are skipped.
         ActivePolicy = &WP;
       }
 

@@ -259,6 +259,9 @@ public:
       case diag::warn_use_in_invalid_state:
         Override.enableConsumedAnalysis = true;
         break;
+      case diag::warn_linear_var_never_consumed:
+        Override.enableLinearityAnalysis = true;
+        break;
       }
     }
   }

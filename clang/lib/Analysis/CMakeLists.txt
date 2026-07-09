@@ -23,6 +23,7 @@ add_clang_library(clangAnalysis
   FixitUtil.cpp
   IntervalPartition.cpp
   IssueHash.cpp
+  Linearity.cpp
   LiveVariables.cpp
   MacroExpansionContext.cpp
   ObjCNoReturn.cpp

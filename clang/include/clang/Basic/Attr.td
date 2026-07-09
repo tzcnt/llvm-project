@@ -4372,6 +4372,35 @@ def TestTypestate : InheritableAttr {
   let Documentation = [TestTypestateDocs];
 }
 
+// C++ linear type attributes.
+
+def Linear : InheritableAttr {
+  // This attribute only appertains to C++ struct/class/union.
+  let Spellings = [Clang<"linear", 0>];
+  let Subjects = SubjectList<[CXXRecord]>;
+  let Args = [StringArgument<"Tag", /*optional=*/1>];
+  let LangOpts = [CPlusPlus];
+  let Documentation = [LinearDocs];
+}
+
+def LinearConsumer : InheritableAttr {
+  // This attribute only appertains to C++ functions and parameters.
+  let Spellings = [Clang<"linear_consumer", 0>];
+  let Subjects = SubjectList<[Function, ParmVar]>;
+  let Args = [StringArgument<"Tag", /*optional=*/1>];
+  let LangOpts = [CPlusPlus];
+  let Documentation = [LinearConsumerDocs];
+}
+
+def LinearProducer : InheritableAttr {
+  // This attribute only appertains to C++ member functions.
+  let Spellings = [Clang<"linear_producer", 0>];
+  let Subjects = SubjectList<[Function]>;
+  let Args = [StringArgument<"Tag", /*optional=*/1>];
+  let LangOpts = [CPlusPlus];
+  let Documentation = [LinearProducerDocs];
+}
+
 // Type safety attributes for `void *' pointers and type tags.
 
 def ArgumentWithTypeTag : InheritableAttr {

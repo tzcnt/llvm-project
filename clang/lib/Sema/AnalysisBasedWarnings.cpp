@@ -32,6 +32,7 @@
 #include "clang/Analysis/Analyses/CFGReachabilityAnalysis.h"
 #include "clang/Analysis/Analyses/CalledOnceCheck.h"
 #include "clang/Analysis/Analyses/Consumed.h"
+#include "clang/Analysis/Analyses/Linearity.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeSafety.h"
 #include "clang/Analysis/Analyses/ReachableCode.h"
 #include "clang/Analysis/Analyses/ThreadSafety.h"
@@ -2417,6 +2418,95 @@ public:
 } // namespace clang
 
 //===----------------------------------------------------------------------===//
+// -Wlinear
+//===----------------------------------------------------------------------===//
+
+namespace clang {
+namespace linearity {
+namespace {
+class LinearityWarningsHandler : public LinearityWarningsHandlerBase {
+  using OptionalNotes = SmallVector<PartialDiagnosticAt, 1>;
+  using DelayedDiag = std::pair<PartialDiagnosticAt, OptionalNotes>;
+
+  Sema &S;
+  std::list<DelayedDiag> Warnings;
+
+  void addDiag(PartialDiagnosticAt Warning) {
+    Warnings.emplace_back(std::move(Warning), OptionalNotes());
+  }
+
+  void addDiagWithNote(PartialDiagnosticAt Warning, SourceLocation NoteLoc,
+                       unsigned NoteDiagID) {
+    OptionalNotes Notes;
+    if (NoteLoc.isValid() && NoteLoc != Warning.first)
+      Notes.emplace_back(NoteLoc, S.PDiag(NoteDiagID));
+    Warnings.emplace_back(std::move(Warning), std::move(Notes));
+  }
+
+public:
+  LinearityWarningsHandler(Sema &S) : S(S) {}
+
+  void emitDiagnostics() override {
+    Warnings.sort(SortDiagBySourceLocation(S.getSourceManager()));
+    for (const auto &Diag : Warnings) {
+      S.Diag(Diag.first.first, Diag.first.second);
+      for (const auto &Note : Diag.second)
+        S.Diag(Note.first, Note.second);
+    }
+  }
+
+  void warnNeverConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
+                         SourceLocation CreatedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, Name.empty()
+                 ? S.PDiag(diag::warn_linear_temp_never_consumed) << Ty
+                 : S.PDiag(diag::warn_linear_var_never_consumed) << Name
+                       << Ty);
+    addDiagWithNote(std::move(Warning), CreatedLoc,
+                    diag::note_linear_created_here);
+  }
+
+  void warnMaybeNotConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
+                            SourceLocation ConsumedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, Name.empty()
+                 ? S.PDiag(diag::warn_linear_temp_maybe_unconsumed) << Ty
+                 : S.PDiag(diag::warn_linear_var_maybe_unconsumed) << Name
+                       << Ty);
+    addDiagWithNote(std::move(Warning), ConsumedLoc,
+                    diag::note_linear_consumed_here);
+  }
+
+  void warnUseAfterConsume(SourceLocation Loc, StringRef Name, QualType Ty,
+                           bool Maybe, SourceLocation ConsumedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, Name.empty()
+                 ? S.PDiag(diag::warn_linear_temp_already_consumed)
+                       << Ty << (Maybe ? 1 : 0)
+                 : S.PDiag(diag::warn_linear_var_already_consumed)
+                       << Name << Ty << (Maybe ? 1 : 0));
+    addDiagWithNote(std::move(Warning), ConsumedLoc,
+                    diag::note_linear_consumed_here);
+  }
+
+  void warnAssignDiscards(SourceLocation Loc, StringRef Name, QualType Ty,
+                          SourceLocation CreatedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, S.PDiag(diag::warn_linear_assign_discards) << Name << Ty);
+    addDiagWithNote(std::move(Warning), CreatedLoc,
+                    diag::note_linear_created_here);
+  }
+
+  void warnLoopStateMismatch(SourceLocation Loc, StringRef Name) override {
+    addDiag(PartialDiagnosticAt(
+        Loc, S.PDiag(diag::warn_linear_loop_state_mismatch) << Name));
+  }
+};
+} // anonymous namespace
+} // namespace linearity
+} // namespace clang
+
+//===----------------------------------------------------------------------===//
 // Unsafe buffer usage analysis.
 //===----------------------------------------------------------------------===//
 
@@ -2719,6 +2809,7 @@ sema::AnalysisBasedWarnings::Policy::Policy() {
   enableCheckUnreachable = 0;
   enableThreadSafetyAnalysis = 0;
   enableConsumedAnalysis = 0;
+  enableLinearityAnalysis = 0;
 }
 
 /// InterProceduralData aims to be a storage of whatever data should be passed
@@ -2775,6 +2866,10 @@ sema::AnalysisBasedWarnings::getPolicyInEffectAt(SourceLocation Loc) {
 
   P.enableConsumedAnalysis = PolicyOverrides.enableConsumedAnalysis ||
                              areAnyEnabled(D, Loc, warn_use_in_invalid_state);
+
+  P.enableLinearityAnalysis =
+      PolicyOverrides.enableLinearityAnalysis ||
+      areAnyEnabled(D, Loc, warn_linear_var_never_consumed);
   return P;
 }
 
@@ -2782,6 +2877,7 @@ void sema::AnalysisBasedWarnings::clearOverrides() {
   PolicyOverrides.enableCheckUnreachable = false;
   PolicyOverrides.enableConsumedAnalysis = false;
   PolicyOverrides.enableThreadSafetyAnalysis = false;
+  PolicyOverrides.enableLinearityAnalysis = false;
 }
 
 static void flushDiagnostics(Sema &S, const sema::FunctionScopeInfo *fscope) {
@@ -3075,14 +3171,32 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   //     time.
   DiagnosticsEngine &Diags = S.getDiagnostics();
 
-  if (shouldSkipAnalysisForDecl(S, D))
-    return;
-
   if (S.hasUncompilableErrorOccurred()) {
     // Flush out any possibly unreachable diagnostics.
     flushDiagnostics(S, fscope);
+    // Linearity diagnostics default to errors, so the first reported
+    // violation would otherwise mask violations in all later functions.
+    // Still run the linearity analysis on functions that are themselves
+    // error-free.
+    if (P.enableLinearityAnalysis && !shouldSkipAnalysisForDecl(S, D) &&
+        !fscope->hasUnrecoverableErrorOccurred() && !D->isInvalidDecl() &&
+        linearity::functionUsesLinearTypes(D)) {
+      AnalysisDeclContext AC(/*AnalysisDeclContextManager=*/nullptr, D);
+      AC.getCFGBuildOptions().PruneTriviallyFalseEdges = true;
+      AC.getCFGBuildOptions().AddEHEdges = false;
+      AC.getCFGBuildOptions().AddInitializers = true;
+      AC.getCFGBuildOptions().AddImplicitDtors = true;
+      AC.getCFGBuildOptions().AddTemporaryDtors = true;
+      AC.getCFGBuildOptions().AddCXXDefaultInitExprInCtors = true;
+      AC.getCFGBuildOptions().setAllAlwaysAdd();
+      linearity::LinearityWarningsHandler WarningHandler(S);
+      linearity::runLinearityAnalysis(AC, WarningHandler);
+    }
     return;
   }
+
+  if (shouldSkipAnalysisForDecl(S, D))
+    return;
 
   const Stmt *Body = D->getBody();
   assert(Body);
@@ -3103,6 +3217,11 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
 
   bool EnableLifetimeSafetyAnalysis = lifetimes::IsLifetimeSafetyEnabled(S, D);
 
+  // The linearity analysis needs a fully-linearized CFG, which is expensive;
+  // only run it on functions that actually mention a linear type.
+  bool EnableLinearityAnalysis =
+      P.enableLinearityAnalysis && linearity::functionUsesLinearTypes(D);
+
   // Force that certain expressions appear as CFGElements in the CFG.  This
   // is used to speed up various analyses.
   // FIXME: This isn't the right factoring.  This is here for initial
@@ -3110,7 +3229,8 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   // expect to always be CFGElements and then fill in the BuildOptions
   // appropriately.  This is essentially a layering violation.
   if (P.enableCheckUnreachable || P.enableThreadSafetyAnalysis ||
-      P.enableConsumedAnalysis || EnableLifetimeSafetyAnalysis) {
+      P.enableConsumedAnalysis || EnableLifetimeSafetyAnalysis ||
+      EnableLinearityAnalysis) {
     // Unreachable code analysis and thread safety require a linearized CFG.
     AC.getCFGBuildOptions().setAllAlwaysAdd();
   } else {
@@ -3184,6 +3304,12 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     consumed::ConsumedWarningsHandler WarningHandler(S);
     consumed::ConsumedAnalyzer Analyzer(WarningHandler);
     Analyzer.run(AC);
+  }
+
+  // Check for violations of linear type semantics.
+  if (EnableLinearityAnalysis) {
+    linearity::LinearityWarningsHandler WarningHandler(S);
+    linearity::runLinearityAnalysis(AC, WarningHandler);
   }
 
   if (!Diags.isIgnored(diag::warn_uninit_var, D->getBeginLoc()) ||

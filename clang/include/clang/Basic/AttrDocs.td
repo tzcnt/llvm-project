@@ -3866,6 +3866,70 @@ This attribute accepts a single parameter that must be one of the following:
   }];
 }
 
+def LinearDocs : Documentation {
+  let Category = DocCatConsumed;
+  let Content = [{
+The ``clang::linear`` attribute marks a class as a *linear type*: every value
+of the type that is created must be *consumed exactly once* on every
+control-flow path. Consuming a value means one of:
+
+* moving from it (move construction, move assignment, or binding it to an
+  rvalue-reference or by-value function parameter),
+* calling a member function marked ``clang::linear_consumer`` on it,
+* returning it from the enclosing function.
+
+The analysis is flow-sensitive and intra-procedural, and reports (by default
+as errors, controllable with ``-Wlinear``):
+
+* a local variable or temporary of linear type that is destroyed, or reaches
+  the end of the function, without having been consumed,
+* a value that is consumed a second time (this also catches use-after-move),
+* an assignment that overwrites a still-unconsumed linear value,
+* a value whose consumption state differs between loop iterations.
+
+The attribute accepts an optional string tag naming the linearity domain,
+e.g. ``[[clang::linear("my_library_awaitable")]]``. Member functions marked
+with ``clang::linear_consumer`` only consume the object if their tag matches
+the tag on the class.
+
+This is intended for move-only resource-owning types where dropping a value
+is a bug rather than a valid disposal, such as lazy coroutine handles which
+leak if never awaited, or file handles that must be explicitly committed or
+rolled back.
+  }];
+}
+
+def LinearConsumerDocs : Documentation {
+  let Category = DocCatConsumed;
+  let Content = [{
+The ``clang::linear_consumer`` attribute marks an operation as consuming a
+value of a class marked ``clang::linear``.
+
+When applied to a non-static member function (including conversion operators),
+calling that function consumes the object it is invoked on. When applied to a
+function parameter, passing an argument to that parameter consumes the
+argument. The optional string tag must match the tag of the ``clang::linear``
+attribute on the class for the consumption to apply.
+
+Note that binding a linear value to an rvalue-reference or by-value parameter
+of *any* function already consumes it without annotation; this attribute is
+needed for member functions that consume ``*this`` (which an ordinary call
+does not imply), and to document designated consuming APIs.
+  }];
+}
+
+def LinearProducerDocs : Documentation {
+  let Category = DocCatConsumed;
+  let Content = [{
+The ``clang::linear_producer`` attribute marks a non-static member function of
+a class marked ``clang::linear`` as re-arming the object: after the call, the
+object (again) holds a value that must be consumed exactly once. This supports
+reusable containers of linear values, e.g. a task group that can be refilled
+with ``add()`` after its previous contents were awaited. The optional string
+tag must match the tag of the ``clang::linear`` attribute on the class.
+  }];
+}
+
 def NoProfileInstrumentFunctionDocs : Documentation {
   let Category = DocCatFunction;
   let Content = [{

@@ -1231,6 +1231,57 @@ static void handleTestTypestateAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   D->addAttr(::new (S.Context) TestTypestateAttr(S.Context, AL, TestState));
 }
 
+// Reads the optional string tag argument of clang::linear /
+// clang::linear_consumer. Returns false on invalid argument.
+static bool getLinearTagArg(Sema &S, const ParsedAttr &AL, StringRef &Tag) {
+  Tag = "";
+  if (AL.getNumArgs() == 0)
+    return true;
+  return S.checkStringLiteralArgumentAttr(AL, 0, Tag);
+}
+
+static void handleLinearAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Tag;
+  if (!getLinearTagArg(S, AL, Tag))
+    return;
+  D->addAttr(::new (S.Context) LinearAttr(S.Context, AL, Tag));
+}
+
+// On a non-static member function, linear_consumer / linear_producer affect
+// *this: check that the class is a linear type with a matching tag, otherwise
+// the attribute is inert and likely a mistake.
+static void checkLinearMethodTag(Sema &S, Decl *D, const ParsedAttr &AL,
+                                 StringRef Tag) {
+  const auto *MD = dyn_cast<CXXMethodDecl>(D);
+  if (!MD || !MD->isInstance())
+    return;
+  const CXXRecordDecl *RD = MD->getParent();
+  if (const LinearAttr *LA = RD->getAttr<LinearAttr>()) {
+    if (LA->getTag() != Tag)
+      S.Diag(AL.getLoc(), diag::warn_linear_consumer_tag_mismatch)
+          << MD << /*tag mismatch*/ 0 << RD;
+  } else {
+    S.Diag(AL.getLoc(), diag::warn_linear_consumer_tag_mismatch)
+        << MD << /*class not linear*/ 1 << RD;
+  }
+}
+
+static void handleLinearConsumerAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Tag;
+  if (!getLinearTagArg(S, AL, Tag))
+    return;
+  checkLinearMethodTag(S, D, AL, Tag);
+  D->addAttr(::new (S.Context) LinearConsumerAttr(S.Context, AL, Tag));
+}
+
+static void handleLinearProducerAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Tag;
+  if (!getLinearTagArg(S, AL, Tag))
+    return;
+  checkLinearMethodTag(S, D, AL, Tag);
+  D->addAttr(::new (S.Context) LinearProducerAttr(S.Context, AL, Tag));
+}
+
 static void handleExtVectorTypeAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   // Remember this typedef decl, we will need it later for diagnostics.
   if (isa<TypedefNameDecl>(D))
@@ -8285,6 +8336,17 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_TestTypestate:
     handleTestTypestateAttr(S, D, AL);
+    break;
+
+  // Linear type analysis attributes.
+  case ParsedAttr::AT_Linear:
+    handleLinearAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_LinearConsumer:
+    handleLinearConsumerAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_LinearProducer:
+    handleLinearProducerAttr(S, D, AL);
     break;
 
   // Type safety attributes.

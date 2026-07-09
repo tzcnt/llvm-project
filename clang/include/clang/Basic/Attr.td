@@ -4387,7 +4387,14 @@ def LinearConsumer : InheritableAttr {
   // This attribute only appertains to C++ functions and parameters.
   let Spellings = [Clang<"linear_consumer", 0>];
   let Subjects = SubjectList<[Function, ParmVar]>;
-  let Args = [StringArgument<"Tag", /*optional=*/1>];
+  // The optional mode argument makes the consumption conditional on the
+  // annotated call returning true: on the returns-false branch the caller
+  // still owns the value.
+  let Args = [StringArgument<"Tag", /*optional=*/1>,
+              EnumArgument<"Mode", "ConsumeMode", /*is_string=*/false,
+                           ["unconditional", "conditional"],
+                           ["Unconditional", "Conditional"], /*opt=*/1>];
+  let StrictEnumParameters = 1;
   let LangOpts = [CPlusPlus];
   let Documentation = [LinearConsumerDocs];
 }

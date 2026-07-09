@@ -34,6 +34,19 @@
 // reference to the same linear class are treated as transparent
 // pass-throughs.
 //
+// Conditional consumption: a consumer annotated
+// [[clang::linear_consumer("tag", conditional)]] consumes only if the call
+// returns true (e.g. posting to a channel that may already be closed). The
+// bound arguments are parked MaybeConsumed at the call; when the call's
+// boolean result reaches a branch terminator — directly, through logical
+// negations, comparisons against bool constants (`== false`, `!= true`),
+// or through a local bool variable initialized with it — the
+// state is split per edge: Consumed where the call returned true, the
+// original Unconsumed state where it returned false. A result that is never
+// tested leaves the value MaybeConsumed, so dropping it is diagnosed at its
+// death; the caller must branch on the result (or otherwise consume the
+// value) to prove the failure path handled.
+//
 // Container taint: moving a linear value into a non-linear local object
 // through an *unannotated* rvalue-reference or by-value parameter of a
 // member call (vec.push_back(std::move(t))) consumes the value but leaves
@@ -195,6 +208,41 @@ static const Expr *canonicalExpr(const Expr *E) {
   }
 }
 
+/// Strips everything a boolean value passes through unchanged on its way
+/// from a call to a branch condition: parentheses, implicit casts, and
+/// ExprWithCleanups. (Negations are handled by the caller, which must count
+/// them.)
+static const Expr *stripCondWrappers(const Expr *E) {
+  while (true) {
+    const Expr *Prev = E;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *EWC = dyn_cast<ExprWithCleanups>(E))
+      E = EWC->getSubExpr();
+    if (E == Prev)
+      return E;
+  }
+}
+
+/// Is this terminator a two-successor branch whose first successor is taken
+/// when the condition is true? (Not the case for e.g. a switch on a bool,
+/// whose successors are case blocks in case order.)
+static bool isBoolBranchTerminator(const Stmt *Term) {
+  if (!Term)
+    return false;
+  switch (Term->getStmtClass()) {
+  case Stmt::IfStmtClass:
+  case Stmt::WhileStmtClass:
+  case Stmt::DoStmtClass:
+  case Stmt::ForStmtClass:
+  case Stmt::ConditionalOperatorClass:
+  case Stmt::BinaryConditionalOperatorClass:
+  case Stmt::BinaryOperatorClass: // && and ||
+    return true;
+  default:
+    return false;
+  }
+}
+
 static StringRef varName(const VarDecl *VD) {
   if (VD->getIdentifier())
     return VD->getName();
@@ -258,12 +306,21 @@ static bool paramRequiresConsumption(const FunctionDecl *FD,
 /// fully discharged there); structural consumption (an unannotated
 /// rvalue-reference or by-value binding) moves the obligation onward — into
 /// the callee, or into the object a member call was invoked on.
-enum class ConsumeKind : uint8_t { None, Annotated, Structural };
+/// AnnotatedConditional is the trusted boundary of a consumer marked
+/// `conditional`: the argument is consumed only if the call returns true.
+enum class ConsumeKind : uint8_t {
+  None,
+  Annotated,
+  AnnotatedConditional,
+  Structural
+};
 
 static ConsumeKind paramConsumeKind(const ParmVarDecl *Param, QualType ArgTy) {
   if (const auto *CA = Param->getAttr<LinearConsumerAttr>())
     if (linearTagMatches(CA->getTag(), ArgTy))
-      return ConsumeKind::Annotated;
+      return CA->getMode() == LinearConsumerAttr::Conditional
+                 ? ConsumeKind::AnnotatedConditional
+                 : ConsumeKind::Annotated;
   QualType ParamTy = Param->getType();
   if (ParamTy->isRValueReferenceType())
     return ConsumeKind::Structural;
@@ -323,6 +380,24 @@ struct ContainerInfo {
   StringRef Tag;
   /// The contained linear type, for diagnostics.
   QualType ElemTy;
+};
+
+/// A tracked object parked by a conditional-consumer call, together with the
+/// state it had before the call so the returns-false edge can restore it.
+struct CondParkedObject {
+  /// PI_Var or PI_Tmp; stored as the raw pointers to avoid a dependency on
+  /// PropagationInfo's declaration order.
+  const VarDecl *Var = nullptr;
+  const CXXBindTemporaryExpr *Tmp = nullptr;
+  LinearInfo Orig;
+};
+
+/// The effect of one conditional-consumer call: its arguments are consumed
+/// iff the call returned true. Recorded when the call is visited and applied
+/// when its boolean result reaches a branch terminator.
+struct CondConsumeInfo {
+  SmallVector<CondParkedObject, 1> Objects;
+  SourceLocation CallLoc;
 };
 
 /// The per-CFG-block map from tracked objects to their linear state.
@@ -506,6 +581,30 @@ public:
   }
 };
 
+/// Refine \p Map along one edge of a branch that tested a
+/// conditional-consumer call's result: on the returned-true edge the parked
+/// objects are consumed; on the returned-false edge the caller still owns
+/// them, so their pre-call state is restored. An object whose state was
+/// touched between the call and the branch (a second consume already
+/// diagnosed, an assignment) is left alone.
+static void applyCondSplit(LinearStateMap &Map, const CondConsumeInfo &Info,
+                           bool CallReturnedTrue) {
+  for (const CondParkedObject &P : Info.Objects) {
+    std::optional<LinearInfo> Cur =
+        P.Var ? Map.getState(P.Var) : Map.getState(P.Tmp);
+    if (!Cur || Cur->St != LinearInfo::LS_MaybeConsumed ||
+        Cur->Loc != Info.CallLoc)
+      continue;
+    LinearInfo NewInfo = CallReturnedTrue
+                             ? LinearInfo(LinearInfo::LS_Consumed, Info.CallLoc)
+                             : P.Orig;
+    if (P.Var)
+      Map.setState(P.Var, NewInfo);
+    else
+      Map.setState(P.Tmp, NewInfo);
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Statement visitor
 //===----------------------------------------------------------------------===//
@@ -621,6 +720,13 @@ class LinearityStmtVisitor : public ConstStmtVisitor<LinearityStmtVisitor> {
   /// (move construction), keyed by the canonical CXXConstructExpr. Applied
   /// when the constructed object is bound to a variable.
   llvm::DenseMap<const Stmt *, ContainerInfo> PendingCtorTaint;
+  /// Conditional-consumer calls whose parked arguments await a branch on the
+  /// call's boolean result, keyed by the canonical call expression.
+  llvm::DenseMap<const Stmt *, CondConsumeInfo> CondConsumeMap;
+  /// Local bool variables initialized with a conditional-consumer call's
+  /// result (`bool ok = token.post(std::move(t));`), mapping to the call's
+  /// CondConsumeMap key. Invalidated on reassignment.
+  llvm::DenseMap<const VarDecl *, const Stmt *> CondBoolVarMap;
   /// Container variables for which a diagnostic has been emitted; consulted
   /// by the whole-function backstop to avoid double reports.
   llvm::SmallPtrSetImpl<const VarDecl *> &ReportedContainers;
@@ -717,6 +823,115 @@ public:
       return;
     if (trackedState(PI))
       setTrackedState(PI, LinearInfo(LinearInfo::LS_Consumed, Loc));
+  }
+
+  /// Park the tracked objects bound to \p Call's conditional-consumer
+  /// parameters: consumed iff the call returns true. Until (unless) a branch
+  /// on the result is found they are MaybeConsumed, which is also the
+  /// correct final state when the result is discarded — the value then
+  /// really is consumed on only some runtime paths, and its death is
+  /// diagnosed. An object that is not (any longer) Unconsumed is consumed
+  /// the ordinary way, which diagnoses the double-consume at the call.
+  void registerCondConsume(const CallExpr *Call,
+                           ArrayRef<PropagationInfo> Objects) {
+    CondConsumeInfo Info;
+    Info.CallLoc = Call->getExprLoc();
+    for (const PropagationInfo &PI : Objects) {
+      std::optional<LinearInfo> Cur = trackedState(PI);
+      if (!Cur)
+        continue;
+      if (Cur->St != LinearInfo::LS_Unconsumed) {
+        consumeObject(PI, Call->getExprLoc());
+        continue;
+      }
+      CondParkedObject Parked;
+      if (PI.isVar())
+        Parked.Var = PI.getVar();
+      else
+        Parked.Tmp = PI.getTmp();
+      Parked.Orig = *Cur;
+      Info.Objects.push_back(Parked);
+      setTrackedState(
+          PI, LinearInfo(LinearInfo::LS_MaybeConsumed, Call->getExprLoc()));
+    }
+    if (!Info.Objects.empty())
+      CondConsumeMap[canonicalExpr(Call)] = std::move(Info);
+  }
+
+  /// If \p Cond (a branch terminator's condition) tests the result of a
+  /// conditional-consumer call — directly, through any number of logical
+  /// negations, comparisons against bool constants (`== false`, `!= true`,
+  /// `== 0`), or through a local bool variable initialized with it — return
+  /// the call's parked-consumption record. \p Negated reports whether the
+  /// condition is true when the call returned *false*.
+  const CondConsumeInfo *resolveConditionalConsume(const Expr *Cond,
+                                                   bool &Negated) const {
+    // A bool constant in a comparison: true/false literals, or the integer
+    // literals 0/1 (`ok == 0`). Other integers never equal a bool truthfully
+    // enough to resolve.
+    auto AsBoolConst = [](const Expr *E, bool &Val) {
+      if (const auto *BL = dyn_cast<CXXBoolLiteralExpr>(E)) {
+        Val = BL->getValue();
+        return true;
+      }
+      if (const auto *IL = dyn_cast<IntegerLiteral>(E)) {
+        if (IL->getValue() == 0) {
+          Val = false;
+          return true;
+        }
+        if (IL->getValue() == 1) {
+          Val = true;
+          return true;
+        }
+      }
+      return false;
+    };
+
+    Negated = false;
+    const Expr *E = stripCondWrappers(Cond);
+    while (true) {
+      if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+        if (UO->getOpcode() != UO_LNot)
+          return nullptr;
+        Negated = !Negated;
+        E = stripCondWrappers(UO->getSubExpr());
+        continue;
+      }
+      if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+        if (BO->getOpcode() != BO_EQ && BO->getOpcode() != BO_NE)
+          return nullptr;
+        const Expr *LHS = stripCondWrappers(BO->getLHS());
+        const Expr *RHS = stripCondWrappers(BO->getRHS());
+        bool LitVal;
+        const Expr *Other = RHS;
+        if (!AsBoolConst(LHS, LitVal)) {
+          Other = LHS;
+          if (!AsBoolConst(RHS, LitVal))
+            return nullptr;
+        }
+        // `x == false` and `x != true` negate; `x == true` and `x != false`
+        // are the identity.
+        if (LitVal == (BO->getOpcode() == BO_NE))
+          Negated = !Negated;
+        E = Other;
+        continue;
+      }
+      break;
+    }
+    const Stmt *Key = E;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (!VD)
+        return nullptr;
+      auto VIt = CondBoolVarMap.find(VD);
+      if (VIt == CondBoolVarMap.end())
+        return nullptr;
+      Key = VIt->second;
+    }
+    auto It = CondConsumeMap.find(Key);
+    if (It == CondConsumeMap.end())
+      return nullptr;
+    return &It->second;
   }
 
   /// If \p E refers to a local (non-reference) variable of linear type,
@@ -819,17 +1034,25 @@ public:
   /// two handles to the same container (begin/end) consumes it once.
   /// A structural consumption of a tracked linear value is reported through
   /// \p StructuralElemAttr / \p StructuralElemTy so member calls can taint
-  /// their object.
+  /// their object. Values bound to conditional-consumer parameters are
+  /// collected into \p CondParked (when the caller provides it) instead of
+  /// being consumed; contexts without a testable result (constructors) pass
+  /// null and consume unconditionally.
   void handleArgumentBinding(
       const ParmVarDecl *Param, const Expr *Arg,
       llvm::SmallPtrSetImpl<const VarDecl *> &ConsumedContainers,
-      const LinearAttr *&StructuralElemAttr, QualType &StructuralElemTy) {
+      const LinearAttr *&StructuralElemAttr, QualType &StructuralElemTy,
+      SmallVectorImpl<PropagationInfo> *CondParked = nullptr) {
     PropagationInfo ArgPI = findInfo(Arg);
     if (ArgPI.isTracked()) {
       QualType ArgTy = trackedType(ArgPI);
       ConsumeKind CK = paramConsumeKind(Param, ArgTy);
       if (CK == ConsumeKind::None)
         return;
+      if (CK == ConsumeKind::AnnotatedConditional && CondParked) {
+        CondParked->push_back(ArgPI);
+        return;
+      }
       consumeObject(ArgPI, Arg->getExprLoc());
       if (CK == ConsumeKind::Structural)
         if (const LinearAttr *LA = getLinearAttr(ArgTy)) {
@@ -954,16 +1177,23 @@ public:
     llvm::SmallPtrSet<const VarDecl *, 2> ConsumedContainers;
     const LinearAttr *StructuralElemAttr = nullptr;
     QualType StructuralElemTy;
+    SmallVector<PropagationInfo, 1> CondParked;
+    // A conditional consumer with a non-bool result cannot be tested;
+    // fall back to unconditional consumption at the binding.
+    bool ResultTestable = Call->getType()->isBooleanType();
 
     for (unsigned Index = Offset; Index < Call->getNumArgs(); ++Index) {
       if (Index - Offset >= FunD->getNumParams())
         break;
       handleArgumentBinding(FunD->getParamDecl(Index - Offset),
                             Call->getArg(Index), ConsumedContainers,
-                            StructuralElemAttr, StructuralElemTy);
+                            StructuralElemAttr, StructuralElemTy,
+                            ResultTestable ? &CondParked : nullptr);
     }
     for (const VarDecl *Root : ConsumedContainers)
       consumeContainer(Root, Call->getExprLoc());
+    if (!CondParked.empty())
+      registerCondConsume(Call, CondParked);
 
     if (!ObjArg)
       return;
@@ -993,7 +1223,11 @@ public:
 
     if (const auto *CA = FunD->getAttr<LinearConsumerAttr>()) {
       if (linearTagMatches(CA->getTag(), trackedType(ObjPI))) {
-        consumeObject(ObjPI, Call->getExprLoc());
+        if (CA->getMode() == LinearConsumerAttr::Conditional &&
+            Call->getType()->isBooleanType())
+          registerCondConsume(Call, ObjPI);
+        else
+          consumeObject(ObjPI, Call->getExprLoc());
         return;
       }
     }
@@ -1135,14 +1369,18 @@ public:
       break;
     }
     case BO_Assign: {
+      const auto *DRE =
+          dyn_cast<DeclRefExpr>(canonicalExpr(BO->getLHS())->IgnoreImplicit());
+      const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+      // Reassigning a bool that captured a conditional-consumer result ends
+      // that association.
+      if (VD)
+        CondBoolVarMap.erase(VD);
       // Storing a derived pointer into a local pointer variable keeps the
       // handle visible; storing it anywhere else escapes the container.
       PropagationInfo RHSPI = findInfo(BO->getRHS());
       if (!RHSPI.isContainerIter())
         break;
-      const auto *DRE =
-          dyn_cast<DeclRefExpr>(canonicalExpr(BO->getLHS())->IgnoreImplicit());
-      const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
       if (VD && VD->hasLocalStorage())
         IterVarMap[VD] = RHSPI.getContainer();
       else
@@ -1417,6 +1655,15 @@ public:
     if (!isLinearType(VarTy)) {
       if (!Var->hasInit())
         return;
+      // A bool variable capturing a conditional-consumer call's result:
+      // bool ok = token.post(std::move(t)); a later branch on it splits the
+      // parked state.
+      if (VarTy->isBooleanType()) {
+        const Stmt *Key = stripCondWrappers(Var->getInit());
+        if (CondConsumeMap.count(Key))
+          CondBoolVarMap[Var] = Key;
+        return;
+      }
       PropagationInfo InitPI = findInfo(Var->getInit());
       // An iterator variable obtained from a container: auto it =
       // vec.begin();
@@ -1860,6 +2107,37 @@ public:
       // which no dtor CFG elements exist.
       if (CurrBlock == &CFGraph->getExit())
         sweepAtExit();
+
+      // Branch-sensitive refinement for conditional consumers: if this
+      // block's terminator tests the result of a conditional-consumer call,
+      // the parked arguments are consumed on the returned-true edge and
+      // still owned on the returned-false edge.
+      if (CurrBlock->succ_size() == 2 &&
+          isBoolBranchTerminator(CurrBlock->getTerminatorStmt())) {
+        if (const auto *Cond = dyn_cast_or_null<Expr>(
+                CurrBlock->getTerminatorCondition())) {
+          bool Negated = false;
+          const CondConsumeInfo *Split =
+              Visitor.resolveConditionalConsume(Cond, Negated);
+          const CFGBlock *TrueSucc = *CurrBlock->succ_begin();
+          const CFGBlock *FalseSucc = *(CurrBlock->succ_begin() + 1);
+          // Back-edge successors go through the loop-head merge instead of
+          // addInfo; skip the refinement for those (rare) shapes.
+          if (Split && TrueSucc && FalseSucc &&
+              !BlockInfo.isBackEdge(CurrBlock, TrueSucc) &&
+              !BlockInfo.isBackEdge(CurrBlock, FalseSucc)) {
+            auto FalseStates = std::make_unique<LinearStateMap>(*CurrStates);
+            // On the condition-true edge the call returned true unless the
+            // condition negates the result an odd number of times.
+            applyCondSplit(*CurrStates, *Split, /*CallReturnedTrue=*/!Negated);
+            applyCondSplit(*FalseStates, *Split, /*CallReturnedTrue=*/Negated);
+            BlockInfo.addInfo(TrueSucc, CurrStates.get(), CurrStates);
+            BlockInfo.addInfo(FalseSucc, FalseStates.get(), FalseStates);
+            CurrStates = nullptr;
+            continue;
+          }
+        }
+      }
 
       // Propagate state to successors.
       if (CurrBlock->succ_size() > 1 ||

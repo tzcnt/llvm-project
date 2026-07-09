@@ -1270,8 +1270,25 @@ static void handleLinearConsumerAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   StringRef Tag;
   if (!getLinearTagArg(S, AL, Tag))
     return;
+  // Optional mode: linear_consumer("tag", conditional) declares that the
+  // argument (or *this) is consumed only if the call returns true.
+  LinearConsumerAttr::ConsumeMode Mode = LinearConsumerAttr::Unconditional;
+  if (AL.getNumArgs() > 1) {
+    if (!AL.isArgIdent(1)) {
+      S.Diag(AL.getLoc(), diag::err_attribute_argument_n_type)
+          << AL << 2 << AANT_ArgumentIdentifier;
+      return;
+    }
+    IdentifierLoc *IL = AL.getArgAsIdent(1);
+    if (!LinearConsumerAttr::ConvertStrToConsumeMode(
+            IL->getIdentifierInfo()->getName(), Mode)) {
+      S.Diag(IL->getLoc(), diag::warn_attribute_type_not_supported)
+          << AL << IL->getIdentifierInfo();
+      return;
+    }
+  }
   checkLinearMethodTag(S, D, AL, Tag);
-  D->addAttr(::new (S.Context) LinearConsumerAttr(S.Context, AL, Tag));
+  D->addAttr(::new (S.Context) LinearConsumerAttr(S.Context, AL, Tag, Mode));
 }
 
 static void handleLinearProducerAttr(Sema &S, Decl *D, const ParsedAttr &AL) {

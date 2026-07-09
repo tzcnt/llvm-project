@@ -532,3 +532,171 @@ void err_container_class_iter_drop() {
   VecCls<Tok> v;
   v.push_back(make()); // expected-note {{linear value moved into the container here}}
 } // expected-error {{'v' holds at least one value of linear type 'Tok' that is never consumed}}
+
+// Conditional consumption: [[clang::linear_consumer("tag", conditional)]]
+// consumes the argument only if the call returns true (modeling e.g. a
+// channel post that fails and leaves the value untouched when the channel
+// is closed). The tracking state is split on a branch that tests the call's
+// result; the returns-false edge still owns the value.
+struct Chan {
+  bool post([[clang::linear_consumer("tok", conditional)]] Tok &&t);
+  void close();
+};
+struct ChanInt {
+  // A conditional consumer without a testable (boolean) result consumes
+  // unconditionally, as if the mode were absent.
+  int post([[clang::linear_consumer("tok", conditional)]] Tok &&t);
+};
+
+// Attribute argument checking.
+struct BadMode {
+  bool post([[clang::linear_consumer("tok", sometimes)]] Tok &&t); // expected-warning {{attribute argument not supported: 'sometimes'}}
+  bool post2([[clang::linear_consumer("tok", 42)]] Tok &&t); // expected-error {{attribute requires parameter 2 to be an identifier}}
+};
+
+void ok_cond_fallback(Chan &c) {
+  Tok t = make();
+  if (!c.post(std::move(t)))
+    t.finish(); // post failed: still owned here
+}
+void ok_cond_fallback_else(Chan &c) {
+  Tok t = make();
+  if (c.post(std::move(t))) {
+  } else {
+    sink(std::move(t));
+  }
+}
+void ok_cond_double_negation(Chan &c) {
+  Tok t = make();
+  if (!!c.post(std::move(t))) {
+  } else {
+    t.finish();
+  }
+}
+void ok_cond_bool_var(Chan &c) {
+  Tok t = make();
+  bool ok = c.post(std::move(t));
+  if (!ok)
+    t.finish();
+}
+void ok_cond_ternary(Chan &c) {
+  Tok t = make();
+  c.post(std::move(t)) ? (void)0 : sink(std::move(t));
+}
+void ok_cond_retry_loop(Chan &c) {
+  Tok t = make();
+  while (!c.post(std::move(t))) {
+  }
+}
+void ok_cond_retry_nested(Chan &c) {
+  Tok t = make();
+  if (!c.post(std::move(t))) {
+    if (!c.post(std::move(t)))
+      t.finish();
+  }
+}
+void ok_cond_nonbool_result(ChanInt &c) {
+  Tok t = make();
+  c.post(std::move(t));
+}
+
+void err_cond_drop_on_false(Chan &c) {
+  Tok t = make();
+  if (!c.post(std::move(t))) { // expected-note {{consumed here}}
+    // t is still owned here and then dropped.
+  }
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+
+void err_cond_result_discarded(Chan &c) {
+  Tok t = make();
+  c.post(std::move(t)); // expected-note {{consumed here}}
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+
+void err_cond_use_after_success(Chan &c) {
+  Tok t = make();
+  if (c.post(std::move(t))) // expected-note {{consumed here}}
+    t.finish(); // expected-error {{linear variable 't' of type 'Tok' is used after being consumed}}
+  else
+    sink(std::move(t));
+}
+
+void err_cond_repost_unbranched(Chan &c) {
+  Tok t = make();
+  c.post(std::move(t)); // expected-note {{consumed here}}
+  c.post(std::move(t)); // expected-error {{linear variable 't' of type 'Tok' is potentially used after being consumed}}
+}
+
+// A temporary argument cannot be recovered on the failure path: it dies at
+// the end of the condition's full-expression, where it is only maybe
+// consumed. Use a named variable to write the fallback.
+void err_cond_temp_arg(Chan &c) {
+  if (!c.post(make())) { // expected-error {{temporary of linear type 'Tok' is not consumed on every control-flow path}} expected-note {{consumed here}}
+  }
+}
+
+// Reassigning the bool that captured the result ends the association: the
+// analysis conservatively keeps the value maybe-consumed on both branches.
+void err_cond_bool_var_reassigned(Chan &c, bool other) {
+  Tok t = make();
+  bool ok = c.post(std::move(t)); // expected-note 2 {{consumed here}}
+  ok = other;
+  if (!ok)
+    t.finish(); // expected-error {{linear variable 't' of type 'Tok' is potentially used after being consumed}}
+  else
+    sink(std::move(t)); // expected-error {{linear variable 't' of type 'Tok' is potentially used after being consumed}}
+}
+
+// A conditional consumer *method* consumes the object it is invoked on only
+// if it returns true.
+struct [[clang::linear("tok2")]] TryTok {
+  TryTok();
+  TryTok(TryTok &&);
+  ~TryTok();
+  [[clang::linear_consumer("tok2", conditional)]] bool try_commit();
+  [[clang::linear_consumer("tok2")]] void abort();
+};
+TryTok make_try();
+void ok_cond_method() {
+  TryTok t = make_try();
+  if (!t.try_commit())
+    t.abort();
+}
+void err_cond_method_drop() {
+  TryTok t = make_try();
+  if (t.try_commit()) { // expected-note {{consumed here}}
+  }
+} // expected-error {{linear variable 't' of type 'TryTok' is not consumed on every control-flow path}}
+
+// Comparisons against bool constants are equivalent to the negation forms.
+void ok_cond_eq_false(Chan &c) {
+  Tok t = make();
+  bool ok = c.post(std::move(t));
+  if (ok == false)
+    t.finish();
+}
+void ok_cond_ne_true_direct(Chan &c) {
+  Tok t = make();
+  if (c.post(std::move(t)) != true)
+    sink(std::move(t));
+}
+void ok_cond_literal_first(Chan &c) {
+  Tok t = make();
+  if (false == c.post(std::move(t)))
+    t.finish();
+}
+void ok_cond_eq_zero(Chan &c) {
+  Tok t = make();
+  bool ok = c.post(std::move(t));
+  if (ok == 0)
+    t.finish();
+}
+void ok_cond_not_eq_true(Chan &c) {
+  Tok t = make();
+  if (!(c.post(std::move(t)) == true))
+    t.finish();
+}
+void err_cond_eq_true_drop(Chan &c) {
+  Tok t = make();
+  if (c.post(std::move(t)) == true) { // expected-note {{consumed here}}
+  }
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}

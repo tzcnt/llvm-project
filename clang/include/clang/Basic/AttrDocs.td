@@ -3933,6 +3933,27 @@ linear type otherwise receive, so the value's onward path inside the callee
 construction) need not be provable to the analysis. An annotated
 lvalue-reference parameter also consumes its argument, which the structural
 rules alone never do.
+
+The optional ``conditional`` mode, e.g.
+``[[clang::linear_consumer("tag", conditional)]]``, declares that the
+consumption depends on the annotated function's boolean result: the argument
+(or, for a member function, the object) is consumed only if the call returns
+``true``; when it returns ``false`` the caller still owns the value. In the
+caller, the analysis splits the tracking state on a branch that tests the
+call's result (directly, through negations, through comparisons against
+bool constants such as ``== false``, or through a local ``bool`` variable
+initialized with it), so the canonical fallback pattern
+
+.. code-block:: c++
+
+  if (!token.post(std::move(t)))
+    consume_locally(std::move(t)); // call failed: still owned here
+
+checks cleanly, and dropping the value on the returns-false path is
+diagnosed. If the result is never tested, the value counts as consumed on
+only some paths, which is diagnosed when it dies. A ``conditional`` consumer
+that does not return ``bool`` consumes unconditionally, as if the mode were
+absent.
   }];
 }
 

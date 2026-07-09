@@ -2503,6 +2503,36 @@ public:
     addDiag(PartialDiagnosticAt(
         Loc, S.PDiag(diag::warn_linear_loop_state_mismatch) << Name));
   }
+
+  void warnContainerNeverConsumed(SourceLocation Loc, StringRef Name,
+                                  QualType ElemTy,
+                                  SourceLocation TaintLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, S.PDiag(diag::warn_linear_container_never_consumed)
+                 << Name << ElemTy);
+    addDiagWithNote(std::move(Warning), TaintLoc,
+                    diag::note_linear_moved_into_container_here);
+  }
+
+  void warnContainerMaybeNotConsumed(SourceLocation Loc, StringRef Name,
+                                     QualType ElemTy,
+                                     SourceLocation ConsumedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, S.PDiag(diag::warn_linear_container_maybe_unconsumed)
+                 << Name << ElemTy);
+    addDiagWithNote(std::move(Warning), ConsumedLoc,
+                    diag::note_linear_consumed_here);
+  }
+
+  void warnContainerUseAfterConsume(SourceLocation Loc, StringRef Name,
+                                    bool Maybe,
+                                    SourceLocation ConsumedLoc) override {
+    PartialDiagnosticAt Warning(
+        Loc, S.PDiag(diag::warn_linear_container_already_consumed)
+                 << Name << (Maybe ? 1 : 0));
+    addDiagWithNote(std::move(Warning), ConsumedLoc,
+                    diag::note_linear_consumed_here);
+  }
 };
 } // anonymous namespace
 } // namespace linearity

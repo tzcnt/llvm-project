@@ -4534,8 +4534,21 @@ def warn_linear_loop_state_mismatch : Warning<
   "linear consumption state of variable '%0' differs between loop "
   "iterations; a linear value must be consumed exactly once">,
   InGroup<LinearType>, DefaultError;
+def warn_linear_container_never_consumed : Warning<
+  "'%0' holds at least one value of linear type %1 that is never consumed; "
+  "the values must be consumed exactly once (e.g. spawned or awaited) "
+  "before the container is destroyed">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_container_maybe_unconsumed : Warning<
+  "'%0' holds at least one value of linear type %1 that is not consumed on "
+  "every control-flow path">, InGroup<LinearType>, DefaultError;
+def warn_linear_container_already_consumed : Warning<
+  "the linear contents of '%0' are %select{|potentially }1consumed a second "
+  "time">, InGroup<LinearType>, DefaultError;
 def note_linear_created_here : Note<"value created here">;
 def note_linear_consumed_here : Note<"consumed here">;
+def note_linear_moved_into_container_here : Note<
+  "linear value moved into the container here">;
 def note_linear_param_declared_here : Note<
   "parameter declared here; the caller's argument binding consumed the "
   "value, so this function owns it">;

@@ -70,6 +70,25 @@ public:
 
   /// The consumption state of a variable differs between loop iterations.
   virtual void warnLoopStateMismatch(SourceLocation Loc, StringRef Name) {}
+
+  /// A non-linear local object (e.g. a std::vector of tasks) into which a
+  /// linear value was moved is destroyed without the value having been
+  /// consumed.
+  virtual void warnContainerNeverConsumed(SourceLocation Loc, StringRef Name,
+                                          QualType ElemTy,
+                                          SourceLocation TaintLoc) {}
+
+  /// As warnContainerNeverConsumed, but the contents are consumed on only
+  /// some of the control-flow paths reaching the destruction point.
+  virtual void warnContainerMaybeNotConsumed(SourceLocation Loc,
+                                             StringRef Name, QualType ElemTy,
+                                             SourceLocation ConsumedLoc) {}
+
+  /// A container's linear contents are handed to a consuming operation
+  /// after they have (\p Maybe: may have) already been consumed.
+  virtual void warnContainerUseAfterConsume(SourceLocation Loc, StringRef Name,
+                                            bool Maybe,
+                                            SourceLocation ConsumedLoc) {}
 };
 
 /// Quickly scans a function body for any mention of a type carrying the

@@ -305,3 +305,230 @@ template <typename T> struct [[clang::linear("tpl")]] TplTok {
   [[clang::linear_consumer("tpl")]] void finish();
 };
 void err_uninstantiated_spec_param(TplTok<int> &&t) {} // expected-error {{linear parameter 't' of type 'TplTok<int>' is never consumed}}
+
+// Container taint: moving a linear value into a non-linear local object
+// through an unannotated rvalue-reference parameter of a member call leaves
+// the obligation inside the object. The container must be consumed by
+// passing it — or an iterator/pointer obtained from it — to a
+// consumer-annotated parameter; unrecognized uses leniently end tracking.
+template <typename T> struct Vec {
+  T *p;
+  unsigned n;
+  Vec();
+  ~Vec();
+  Vec(Vec &&);
+  Vec &operator=(Vec &&);
+  void push_back(T &&);
+  T &operator[](unsigned);
+  T *begin();
+  T *end();
+  T *data();
+  unsigned size() const;
+  bool empty() const;
+  void clear();
+  void reserve(unsigned);
+};
+
+template <typename I>
+void spawn_iters([[clang::linear_consumer("tok")]] I &&b,
+                 [[clang::linear_consumer("tok")]] I &&e);
+template <typename I>
+void spawn_n([[clang::linear_consumer("tok")]] I &&b, unsigned n);
+template <typename R>
+void spawn_range([[clang::linear_consumer("tok")]] R &&r);
+void take_vec_ref(Vec<Tok> &v);
+
+void ok_container_spawn_range() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_range(v);
+}
+void ok_container_spawn_iters() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_iters(v.begin(), v.end());
+}
+void ok_container_spawn_data_count() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_n(v.data(), v.size());
+}
+void ok_container_ptr_arith() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_iters(v.data(), v.data() + 1);
+}
+void ok_container_iter_vars() {
+  Vec<Tok> v;
+  v.push_back(make());
+  auto b = v.begin();
+  auto e = v.end();
+  spawn_iters(b, e);
+}
+void ok_container_loop_fill(int n) {
+  Vec<Tok> v;
+  v.reserve(4);
+  for (int i = 0; i < n; ++i)
+    v.push_back(make());
+  spawn_range(v);
+}
+void ok_container_empty_guard(int n) {
+  Vec<Tok> v;
+  for (int i = 0; i < n; ++i)
+    v.push_back(make());
+  if (!v.empty())
+    spawn_range(v);
+}
+void ok_container_helper_escape() {
+  Vec<Tok> v;
+  v.push_back(make());
+  take_vec_ref(v); // unannotated reference: lenient escape
+}
+void ok_container_manual_drain() {
+  Vec<Tok> v;
+  v.push_back(make());
+  for (auto &t : v)
+    t.finish();
+}
+void ok_container_elem_drain() {
+  Vec<Tok> v;
+  v.push_back(make());
+  v[0].finish();
+}
+void ok_container_conditional_fill(bool c) {
+  Vec<Tok> v;
+  if (c)
+    v.push_back(make());
+  spawn_range(v);
+}
+void ok_container_reuse() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_range(v);
+  v.clear();
+  v.push_back(make());
+  spawn_range(v);
+}
+void ok_container_move_transfer() {
+  Vec<Tok> v;
+  v.push_back(make());
+  Vec<Tok> v2 = std::move(v);
+  spawn_range(v2);
+}
+Vec<Tok> ok_container_return() {
+  Vec<Tok> v;
+  v.push_back(make());
+  return v; // the obligation moves to the caller
+}
+void ok_container_lambda_fill() {
+  // The lambda's own analysis must not arm the captured container; the
+  // enclosing function owns it.
+  Vec<Tok> v;
+  auto fill = [&v] { v.push_back(make()); };
+  fill();
+  spawn_range(v);
+}
+
+void err_container_fill_drop() {
+  Vec<Tok> v;
+  v.push_back(make()); // expected-note {{linear value moved into the container here}}
+} // expected-error {{'v' holds at least one value of linear type 'Tok' that is never consumed}}
+
+void err_container_loop_fill_drop(int n) {
+  Vec<Tok> v; // expected-error {{'v' holds at least one value of linear type 'Tok' that is never consumed}}
+  for (int i = 0; i < n; ++i)
+    v.push_back(make()); // expected-note {{linear value moved into the container here}}
+}
+
+void err_container_conditional_spawn(bool c) {
+  Vec<Tok> v;
+  v.push_back(make());
+  if (c)
+    spawn_range(v); // expected-note {{consumed here}}
+} // expected-error {{'v' holds at least one value of linear type 'Tok' that is not consumed on every control-flow path}}
+
+void err_container_double_spawn() {
+  Vec<Tok> v;
+  v.push_back(make());
+  spawn_range(v); // expected-note {{consumed here}}
+  spawn_range(v); // expected-error {{the linear contents of 'v' are consumed a second time}}
+}
+
+void err_container_elem_assign_drop() {
+  Vec<Tok> v;
+  v[0] = make(); // expected-note {{linear value moved into the container here}}
+} // expected-error {{'v' holds at least one value of linear type 'Tok' that is never consumed}}
+
+void err_container_move_drop() {
+  Vec<Tok> v;
+  v.push_back(make()); // expected-note {{linear value moved into the container here}}
+  Vec<Tok> v2 = std::move(v);
+} // expected-error {{'v2' holds at least one value of linear type 'Tok' that is never consumed}}
+
+// A non-linear object constructed directly from a linear value.
+template <typename T> struct Opt {
+  Opt(T &&);
+  ~Opt();
+  T take(); // value-returning member: leniently ends tracking
+};
+void ok_opt_take() {
+  Opt<Tok> o(make());
+  o.take().finish();
+}
+void err_opt_drop() {
+  Opt<Tok> o(make()); // expected-note {{linear value moved into the container here}}
+} // expected-error {{'o' holds at least one value of linear type 'Tok' that is never consumed}}
+
+// A container with no destructor produces no dtor CFG elements; taint is
+// reported by the exit sweep at the variable's declaration.
+template <typename T> struct TrivBox {
+  T v;
+  void put(T &&);
+};
+void err_trivbox_drop() {
+  TrivBox<Triv> b; // expected-error {{'b' holds at least one value of linear type 'Triv' that is never consumed}}
+  b.put(make_triv()); // expected-note {{linear value moved into the container here}}
+}
+
+// Detection looks through pointer type arguments, so a handle type whose
+// only linear connection is a pointer argument (libc++'s vector iterator:
+// __wrap_iter<task*>) behaves the same as one that names the container
+// (libstdc++: __normal_iterator<task*, vector<task>>). Writing a linear
+// value through such a view taints it; a consumer-annotated call (e.g.
+// tmc::consume()) discharges it.
+template <typename P> struct PtrIter {
+  P p;
+  PtrIter &operator++();
+  Tok &operator*();
+};
+void err_ptr_view_write(PtrIter<Tok *> it) { // expected-error {{'it' holds at least one value of linear type 'Tok' that is never consumed}}
+  *it = make(); // expected-note {{linear value moved into the container here}}
+}
+void ok_ptr_view_write_consumed(PtrIter<Tok *> it) {
+  *it = make();
+  spawn_n(it, 1); // annotated consumer discharges the view's taint
+}
+
+// A class-type iterator (operator*) works like a pointer iterator.
+template <typename T> struct ClsIter {
+  T *p;
+  T &operator*();
+  ClsIter &operator++();
+  bool operator!=(const ClsIter &) const;
+};
+template <typename T> struct VecCls {
+  VecCls();
+  ~VecCls();
+  void push_back(T &&);
+  ClsIter<T> begin();
+  ClsIter<T> end();
+};
+void ok_container_class_iter() {
+  VecCls<Tok> v;
+  v.push_back(make());
+  spawn_iters(v.begin(), v.end());
+}
+void err_container_class_iter_drop() {
+  VecCls<Tok> v;
+  v.push_back(make()); // expected-note {{linear value moved into the container here}}
+} // expected-error {{'v' holds at least one value of linear type 'Tok' that is never consumed}}

@@ -2456,27 +2456,35 @@ public:
   }
 
   void warnNeverConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
-                         SourceLocation CreatedLoc, bool IsParam) override {
+                         SourceLocation CreatedLoc, bool IsParam,
+                         bool IsDrain) override {
+    unsigned TempDiag = IsDrain ? diag::warn_linear_temp_never_drained
+                                : diag::warn_linear_temp_never_consumed;
+    unsigned VarDiag = IsDrain ? diag::warn_linear_var_never_drained
+                               : diag::warn_linear_var_never_consumed;
     PartialDiagnosticAt Warning(
-        Loc, Name.empty()
-                 ? S.PDiag(diag::warn_linear_temp_never_consumed) << Ty
-                 : S.PDiag(diag::warn_linear_var_never_consumed)
-                       << Name << Ty << (IsParam ? 1 : 0));
+        Loc, Name.empty() ? S.PDiag(TempDiag) << Ty
+                          : S.PDiag(VarDiag)
+                                << Name << Ty << (IsParam ? 1 : 0));
     addDiagWithNote(std::move(Warning), CreatedLoc,
                     IsParam ? diag::note_linear_param_declared_here
                             : diag::note_linear_created_here);
   }
 
   void warnMaybeNotConsumed(SourceLocation Loc, StringRef Name, QualType Ty,
-                            SourceLocation ConsumedLoc,
-                            bool IsParam) override {
+                            SourceLocation ConsumedLoc, bool IsParam,
+                            bool IsDrain) override {
+    unsigned TempDiag = IsDrain ? diag::warn_linear_temp_maybe_undrained
+                                : diag::warn_linear_temp_maybe_unconsumed;
+    unsigned VarDiag = IsDrain ? diag::warn_linear_var_maybe_undrained
+                               : diag::warn_linear_var_maybe_unconsumed;
     PartialDiagnosticAt Warning(
-        Loc, Name.empty()
-                 ? S.PDiag(diag::warn_linear_temp_maybe_unconsumed) << Ty
-                 : S.PDiag(diag::warn_linear_var_maybe_unconsumed)
-                       << Name << Ty << (IsParam ? 1 : 0));
+        Loc, Name.empty() ? S.PDiag(TempDiag) << Ty
+                          : S.PDiag(VarDiag)
+                                << Name << Ty << (IsParam ? 1 : 0));
     addDiagWithNote(std::move(Warning), ConsumedLoc,
-                    diag::note_linear_consumed_here);
+                    IsDrain ? diag::note_linear_awaited_here
+                            : diag::note_linear_consumed_here);
   }
 
   void warnUseAfterConsume(SourceLocation Loc, StringRef Name, QualType Ty,

@@ -1259,10 +1259,10 @@ static void checkLinearMethodTag(Sema &S, Decl *D, const ParsedAttr &AL,
   if (const LinearAttr *LA = RD->getAttr<LinearAttr>()) {
     if (LA->getTag() != Tag)
       S.Diag(AL.getLoc(), diag::warn_linear_consumer_tag_mismatch)
-          << MD << /*tag mismatch*/ 0 << RD;
+          << AL << MD << /*tag mismatch*/ 0 << RD;
   } else {
     S.Diag(AL.getLoc(), diag::warn_linear_consumer_tag_mismatch)
-        << MD << /*class not linear*/ 1 << RD;
+        << AL << MD << /*class not linear*/ 1 << RD;
   }
 }
 
@@ -1297,6 +1297,14 @@ static void handleLinearProducerAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
     return;
   checkLinearMethodTag(S, D, AL, Tag);
   D->addAttr(::new (S.Context) LinearProducerAttr(S.Context, AL, Tag));
+}
+
+static void handleLinearSentinelAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  StringRef Tag;
+  if (!getLinearTagArg(S, AL, Tag))
+    return;
+  checkLinearMethodTag(S, D, AL, Tag);
+  D->addAttr(::new (S.Context) LinearSentinelAttr(S.Context, AL, Tag));
 }
 
 static void handleExtVectorTypeAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
@@ -8364,6 +8372,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_LinearProducer:
     handleLinearProducerAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_LinearSentinel:
+    handleLinearSentinelAttr(S, D, AL);
     break;
 
   // Type safety attributes.

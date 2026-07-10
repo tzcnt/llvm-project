@@ -89,6 +89,7 @@
 #include "clang/Basic/OperatorKinds.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include <cassert>
 #include <memory>
@@ -177,6 +178,23 @@ static const LinearAttr *getLinearElementAttr(QualType QT, unsigned Depth = 0) {
   return nullptr;
 }
 
+/// Is this linear type consumed by draining rather than by a single
+/// consuming use, i.e. does it have a sentinel-mode linear_consumer member
+/// (see the mux/multiplexer model)? Selects drain-specific diagnostic
+/// wording.
+static bool typeIsDrainable(QualType QT) {
+  if (QT.isNull())
+    return false;
+  const CXXRecordDecl *RD = QT->getAsCXXRecordDecl();
+  if (!RD || !RD->hasDefinition())
+    return false;
+  for (const CXXMethodDecl *MD : RD->methods())
+    if (const auto *CA = MD->getAttr<LinearConsumerAttr>())
+      if (CA->getMode() == LinearConsumerAttr::Sentinel)
+        return true;
+  return false;
+}
+
 /// Is this class type iterator-like, i.e. does it declare an operator*?
 /// Used to decide whether a member call returning a class object hands out
 /// access to a tainted container's elements (begin()) or is unrelated.
@@ -195,14 +213,25 @@ static bool typeHasStarOperator(QualType QT) {
   return false;
 }
 
-/// Strips parentheses and ExprWithCleanups wrappers; the canonical key for
-/// the propagation map.
+/// Strips parentheses, ExprWithCleanups, and OpaqueValueExpr wrappers; the
+/// canonical key for the propagation map. OpaqueValueExpr must be unwrapped
+/// to its source expression because it is not itself a CFG element: the
+/// coroutine await machinery refers to the awaiter through one
+/// (`opaque.await_resume()` where the source is the await_transform /
+/// operator co_await call), and the lookup must reach the value inserted
+/// for that call.
 static const Expr *canonicalExpr(const Expr *E) {
   while (true) {
     E = E->IgnoreParens();
     if (const auto *EWC = dyn_cast<ExprWithCleanups>(E)) {
       E = EWC->getSubExpr();
       continue;
+    }
+    if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E)) {
+      if (const Expr *Src = OVE->getSourceExpr()) {
+        E = Src;
+        continue;
+      }
     }
     return E;
   }
@@ -393,8 +422,9 @@ struct CondParkedObject {
 };
 
 /// The effect of one conditional-consumer call: its arguments are consumed
-/// iff the call returned true. Recorded when the call is visited and applied
-/// when its boolean result reaches a branch terminator.
+/// iff the call returned true (bool mode), or iff the call's result compares
+/// equal to the object's sentinel (sentinel mode). Recorded when the call is
+/// visited and applied when its result reaches a branch terminator.
 struct CondConsumeInfo {
   SmallVector<CondParkedObject, 1> Objects;
   /// Fresh temporaries of trivially-destructible linear types bound to the
@@ -405,6 +435,12 @@ struct CondConsumeInfo {
   /// report their non-trivial counterparts get at the temporary's dtor.
   SmallVector<std::pair<SourceLocation, QualType>, 1> FreshTemps;
   SourceLocation CallLoc;
+  /// Non-null for a sentinel-mode consumer method call: the object the call
+  /// was invoked on. The state splits only on a comparison between the
+  /// call's result and this object's own linear_sentinel member.
+  const VarDecl *SentinelObj = nullptr;
+
+  bool isSentinel() const { return SentinelObj != nullptr; }
 };
 
 /// The per-CFG-block map from tracked objects to their linear state.
@@ -473,13 +509,19 @@ public:
   void intersectAtLoopHead(const CFGBlock *LoopBack,
                            const LinearStateMap *LoopBackStates,
                            LinearityWarningsHandlerBase &Handler) {
+    // The back-edge block may have no statements or terminator of its own
+    // (a bare continue edge); fall back to the variable's location rather
+    // than handing the diagnostics machinery an invalid one.
     SourceLocation BlameLoc = getLastStmtLoc(LoopBack);
     for (const auto &Entry : LoopBackStates->VarMap) {
       auto It = VarMap.find(Entry.first);
       if (It == VarMap.end())
         continue;
       if (It->second.St != Entry.second.St) {
-        Handler.warnLoopStateMismatch(BlameLoc, varName(Entry.first));
+        Handler.warnLoopStateMismatch(BlameLoc.isValid()
+                                          ? BlameLoc
+                                          : Entry.first->getLocation(),
+                                      varName(Entry.first));
         It->second =
             LinearInfo(LinearInfo::LS_MaybeConsumed,
                        It->second.St == LinearInfo::LS_Unconsumed
@@ -492,7 +534,10 @@ public:
       if (It == ContainerMap.end())
         continue;
       if (It->second.St != Entry.second.St) {
-        Handler.warnLoopStateMismatch(BlameLoc, varName(Entry.first));
+        Handler.warnLoopStateMismatch(BlameLoc.isValid()
+                                          ? BlameLoc
+                                          : Entry.first->getLocation(),
+                                      varName(Entry.first));
         It->second.St = LinearInfo::LS_MaybeConsumed;
       }
     }
@@ -638,6 +683,9 @@ public:
     /// An lvalue denoting one of a container's linear elements (front(),
     /// operator[], *iterator); Var is the underlying container variable.
     PI_ContainerElem,
+    /// The value of a linear_sentinel member call (mux.end()); Var is the
+    /// drainable object it was invoked on.
+    PI_Sentinel,
   };
 
 private:
@@ -678,6 +726,12 @@ public:
     PI.Var = VD;
     return PI;
   }
+  static PropagationInfo makeSentinel(const VarDecl *VD) {
+    PropagationInfo PI;
+    PI.K = PI_Sentinel;
+    PI.Var = VD;
+    return PI;
+  }
 
   Kind getKind() const { return K; }
   bool isValid() const { return K != PI_None; }
@@ -692,6 +746,7 @@ public:
   bool isContainerRelated() const {
     return K == PI_Container || K == PI_ContainerIter || K == PI_ContainerElem;
   }
+  bool isSentinel() const { return K == PI_Sentinel; }
 
   const VarDecl *getVar() const {
     assert(K == PI_Var);
@@ -704,6 +759,11 @@ public:
   /// The container variable a container-related value refers to.
   const VarDecl *getContainer() const {
     assert(isContainerRelated());
+    return Var;
+  }
+  /// The drainable object a sentinel value belongs to.
+  const VarDecl *getSentinelVar() const {
+    assert(K == PI_Sentinel);
     return Var;
   }
 };
@@ -728,12 +788,19 @@ class LinearityStmtVisitor : public ConstStmtVisitor<LinearityStmtVisitor> {
   /// when the constructed object is bound to a variable.
   llvm::DenseMap<const Stmt *, ContainerInfo> PendingCtorTaint;
   /// Conditional-consumer calls whose parked arguments await a branch on the
-  /// call's boolean result, keyed by the canonical call expression.
+  /// call's result, keyed by the canonical call expression (re-keyed to the
+  /// enclosing co_await expression when the call is an awaiter's
+  /// await_resume, so that `size_t i = co_await mux` ties `i` to the call).
   llvm::DenseMap<const Stmt *, CondConsumeInfo> CondConsumeMap;
-  /// Local bool variables initialized with a conditional-consumer call's
-  /// result (`bool ok = token.post(std::move(t));`), mapping to the call's
-  /// CondConsumeMap key. Invalidated on reassignment.
-  llvm::DenseMap<const VarDecl *, const Stmt *> CondBoolVarMap;
+  /// Local scalar variables initialized with a conditional-consumer call's
+  /// result (`bool ok = token.post(std::move(t));`,
+  /// `size_t i = co_await mux;`), mapping to the call's CondConsumeMap key.
+  /// Invalidated on reassignment.
+  llvm::DenseMap<const VarDecl *, const Stmt *> CondResultVarMap;
+  /// Local variables holding a drainable object's sentinel value
+  /// (`auto e = mux.end();`), mapping to the object. Like IterVarMap,
+  /// deliberately not flow-sensitive.
+  llvm::DenseMap<const VarDecl *, const VarDecl *> SentinelVarMap;
   /// Container variables for which a diagnostic has been emitted; consulted
   /// by the whole-function backstop to avoid double reports.
   llvm::SmallPtrSetImpl<const VarDecl *> &ReportedContainers;
@@ -839,16 +906,26 @@ public:
   /// really is consumed on only some runtime paths, and its death is
   /// diagnosed. An object that is not (any longer) Unconsumed is consumed
   /// the ordinary way, which diagnoses the double-consume at the call.
+  ///
+  /// For a sentinel-mode consumer method (\p SentinelObj non-null: the
+  /// object the call was invoked on, consumed iff the result equals the
+  /// object's sentinel) the object is re-parked from *any* state, with its
+  /// current state as the restore value: awaiting an already-drained
+  /// multiplexer is valid (it returns the sentinel again), and consuming a
+  /// known number of results without testing each one is valid as long as a
+  /// later drain is proven.
   void registerCondConsume(
       const CallExpr *Call, ArrayRef<PropagationInfo> Objects,
-      ArrayRef<std::pair<SourceLocation, QualType>> FreshTemps = {}) {
+      ArrayRef<std::pair<SourceLocation, QualType>> FreshTemps = {},
+      const VarDecl *SentinelObj = nullptr) {
     CondConsumeInfo Info;
     Info.CallLoc = Call->getExprLoc();
+    Info.SentinelObj = SentinelObj;
     for (const PropagationInfo &PI : Objects) {
       std::optional<LinearInfo> Cur = trackedState(PI);
       if (!Cur)
         continue;
-      if (Cur->St != LinearInfo::LS_Unconsumed) {
+      if (!SentinelObj && Cur->St != LinearInfo::LS_Unconsumed) {
         consumeObject(PI, Call->getExprLoc());
         continue;
       }
@@ -880,8 +957,8 @@ public:
       const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
       if (!VD)
         return false;
-      auto VIt = CondBoolVarMap.find(VD);
-      if (VIt == CondBoolVarMap.end())
+      auto VIt = CondResultVarMap.find(VD);
+      if (VIt == CondResultVarMap.end())
         return false;
       Key = VIt->second;
     }
@@ -899,6 +976,16 @@ public:
                            : Info.FreshTemps.front().second;
     if (!linearTagMatches(Tag, FirstTy))
       return false;
+    dischargeEntry(It, Loc);
+    return true;
+  }
+
+  /// Mark a pending entry's still-parked objects consumed at \p Loc and
+  /// remove the entry so no later branch split resurrects it.
+  void
+  dischargeEntry(llvm::DenseMap<const Stmt *, CondConsumeInfo>::iterator It,
+                 SourceLocation Loc) {
+    const CondConsumeInfo &Info = It->second;
     for (const CondParkedObject &P : Info.Objects) {
       PropagationInfo PI = P.Var ? PropagationInfo::makeVar(P.Var)
                                  : PropagationInfo::makeTmp(P.Tmp);
@@ -908,7 +995,42 @@ public:
         setTrackedState(PI, LinearInfo(LinearInfo::LS_Consumed, Loc));
     }
     CondConsumeMap.erase(It);
-    return true;
+  }
+
+  /// An annotated (unconditional) consumer receiving an object that is
+  /// parked by a pending *sentinel-mode* call discharges the pending
+  /// obligation for that object: `tmc::consume(mux)` after an untested
+  /// await declares the drain deliberately unproven (the escape hatch for
+  /// count-based consumption). Restricted to sentinel parks: a bool-parked
+  /// value handed to another consumer really is a potential double-consume
+  /// (`post(std::move(t)); spawn(std::move(t))`) and keeps erroring; the
+  /// deliberate-ignore idiom for those is discharging the call's *result*.
+  /// The object is marked consumed and removed from the pending entry so no
+  /// later branch split resurrects it.
+  bool dischargeParkedByObject(const PropagationInfo &PI, SourceLocation Loc) {
+    if (!PI.isTracked())
+      return false;
+    std::optional<LinearInfo> Cur = trackedState(PI);
+    if (!Cur || Cur->St != LinearInfo::LS_MaybeConsumed)
+      return false;
+    const VarDecl *Var = PI.isVar() ? PI.getVar() : nullptr;
+    const CXXBindTemporaryExpr *Tmp = PI.isTmp() ? PI.getTmp() : nullptr;
+    for (auto It = CondConsumeMap.begin(); It != CondConsumeMap.end(); ++It) {
+      CondConsumeInfo &Info = It->second;
+      if (!Info.isSentinel() || Info.CallLoc != Cur->Loc)
+        continue;
+      auto ObjIt = llvm::find_if(Info.Objects, [&](const CondParkedObject &P) {
+        return P.Var == Var && P.Tmp == Tmp;
+      });
+      if (ObjIt == Info.Objects.end())
+        continue;
+      Info.Objects.erase(ObjIt);
+      if (Info.Objects.empty() && Info.FreshTemps.empty())
+        CondConsumeMap.erase(It);
+      setTrackedState(PI, LinearInfo(LinearInfo::LS_Consumed, Loc));
+      return true;
+    }
+    return false;
   }
 
   /// Report fresh temporaries whose conditional-consumer call was never
@@ -918,16 +1040,73 @@ public:
       const CondConsumeInfo &Info = Entry.second;
       for (const auto &FT : Info.FreshTemps)
         Handler.warnMaybeNotConsumed(FT.first, StringRef(), FT.second,
-                                     Info.CallLoc, /*IsParam=*/false);
+                                     Info.CallLoc, /*IsParam=*/false,
+                                     typeIsDrainable(FT.second));
     }
   }
 
+  /// If \p E (an operand within a branch condition or a call argument) ties
+  /// back to a pending conditional-consumer call — directly, through the
+  /// co_await hop (the entry is re-keyed to the CoawaitExpr), through an
+  /// assignment inside the condition (`(i = co_await mux)`), or through a
+  /// local variable initialized with the result — return the pending
+  /// entry's map key.
+  const Stmt *lookupPendingKey(const Expr *E) const {
+    E = stripCondWrappers(E);
+    // `while ((i = co_await mux) != mux.end())`: the assignment's value is
+    // its RHS for this purpose.
+    if (const auto *BO = dyn_cast<BinaryOperator>(E);
+        BO && BO->getOpcode() == BO_Assign)
+      E = stripCondWrappers(BO->getRHS());
+    const Stmt *Key = E;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (!VD)
+        return nullptr;
+      auto VIt = CondResultVarMap.find(VD);
+      if (VIt == CondResultVarMap.end())
+        return nullptr;
+      Key = VIt->second;
+    }
+    return CondConsumeMap.count(Key) ? Key : nullptr;
+  }
+
+  const CondConsumeInfo *lookupPending(const Expr *E) const {
+    const Stmt *Key = lookupPendingKey(E);
+    if (!Key)
+      return nullptr;
+    return &CondConsumeMap.find(Key)->second;
+  }
+
+  /// If \p E (an operand within a branch condition or a call argument)
+  /// denotes a drainable object's sentinel value — a linear_sentinel member
+  /// call, or a local variable holding one — return the object.
+  const VarDecl *lookupSentinel(const Expr *E) const {
+    E = stripCondWrappers(E);
+    PropagationInfo PI = findInfo(E);
+    if (PI.isSentinel())
+      return PI.getSentinelVar();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+      if (VD) {
+        auto It = SentinelVarMap.find(VD);
+        if (It != SentinelVarMap.end())
+          return It->second;
+      }
+    }
+    return nullptr;
+  }
+
   /// If \p Cond (a branch terminator's condition) tests the result of a
-  /// conditional-consumer call — directly, through any number of logical
+  /// conditional-consumer call, return the call's parked-consumption record.
+  /// A bool-mode result is resolved directly, through any number of logical
   /// negations, comparisons against bool constants (`== false`, `!= true`,
-  /// `== 0`), or through a local bool variable initialized with it — return
-  /// the call's parked-consumption record. \p Negated reports whether the
-  /// condition is true when the call returned *false*.
+  /// `== 0`), or through a local bool variable initialized with it. A
+  /// sentinel-mode result is resolved only through an `==` / `!=` comparison
+  /// against the parked object's own sentinel (`i == mux.end()`), possibly
+  /// under negations. \p Negated reports whether the condition is true when
+  /// the call did *not* consume (returned false / result was not the
+  /// sentinel).
   const CondConsumeInfo *resolveConditionalConsume(const Expr *Cond,
                                                    bool &Negated) const {
     // A bool constant in a comparison: true/false literals, or the integer
@@ -970,8 +1149,27 @@ public:
         const Expr *Other = RHS;
         if (!AsBoolConst(LHS, LitVal)) {
           Other = LHS;
-          if (!AsBoolConst(RHS, LitVal))
-            return nullptr;
+          if (!AsBoolConst(RHS, LitVal)) {
+            // Not a bool-constant comparison; try result-vs-sentinel. The
+            // sentinel must belong to the same object the pending call
+            // parked (comparing against a different mux's end() proves
+            // nothing).
+            const VarDecl *SentVD = lookupSentinel(LHS);
+            const Expr *ResSide = RHS;
+            if (!SentVD) {
+              SentVD = lookupSentinel(RHS);
+              ResSide = LHS;
+            }
+            if (!SentVD)
+              return nullptr;
+            const CondConsumeInfo *Info = lookupPending(ResSide);
+            if (!Info || Info->SentinelObj != SentVD)
+              return nullptr;
+            // `res == end()` means consumed (drained); `!=` negates.
+            if (BO->getOpcode() == BO_NE)
+              Negated = !Negated;
+            return Info;
+          }
         }
         // `x == false` and `x != true` negate; `x == true` and `x != false`
         // are the identity.
@@ -982,20 +1180,13 @@ public:
       }
       break;
     }
-    const Stmt *Key = E;
-    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
-      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-      if (!VD)
-        return nullptr;
-      auto VIt = CondBoolVarMap.find(VD);
-      if (VIt == CondBoolVarMap.end())
-        return nullptr;
-      Key = VIt->second;
-    }
-    auto It = CondConsumeMap.find(Key);
-    if (It == CondConsumeMap.end())
+    const CondConsumeInfo *Info = lookupPending(E);
+    // A sentinel-mode result used as a boolean (`if (i)`, `if (i == 1)`)
+    // says nothing about the drain state; only the sentinel comparison
+    // above resolves it.
+    if (Info && Info->isSentinel())
       return nullptr;
-    return &It->second;
+    return Info;
   }
 
   /// If \p E refers to a local (non-reference) variable of linear type,
@@ -1089,6 +1280,17 @@ public:
     }
   }
 
+  /// Evidence, collected across one call's arguments, that the call
+  /// received both a pending conditional-consumer result and the matching
+  /// object's sentinel value — an opaque comparison such as an
+  /// equality-assertion helper (`EXPECT_EQ(idx, mux.end())`). The pending
+  /// obligation is then discharged: the callee is presumed to perform the
+  /// drain check the analysis cannot see.
+  struct OpaqueDischargeState {
+    const Stmt *PendingKey = nullptr;
+    const VarDecl *SentinelSeen = nullptr;
+  };
+
   /// Effects of binding one call argument. Tracked linear values are
   /// consumed per parameter rules. Containers (and iterators/pointers
   /// derived from them) are consumed by consumer-annotated parameters whose
@@ -1108,7 +1310,14 @@ public:
       const LinearAttr *&StructuralElemAttr, QualType &StructuralElemTy,
       SmallVectorImpl<PropagationInfo> *CondParked = nullptr,
       SmallVectorImpl<std::pair<SourceLocation, QualType>> *CondFresh =
-          nullptr) {
+          nullptr,
+      OpaqueDischargeState *Opaque = nullptr) {
+    if (Opaque) {
+      if (!Opaque->PendingKey)
+        Opaque->PendingKey = lookupPendingKey(Arg);
+      if (!Opaque->SentinelSeen)
+        Opaque->SentinelSeen = lookupSentinel(Arg);
+    }
     // An annotated consumer receiving the result of a pending
     // conditional-consumer call discharges that obligation.
     if (const auto *CA = Param->getAttr<LinearConsumerAttr>())
@@ -1123,6 +1332,25 @@ public:
       if (CK == ConsumeKind::AnnotatedConditional && CondParked) {
         CondParked->push_back(ArgPI);
         return;
+      }
+      if (CK == ConsumeKind::Annotated) {
+        // A drainable object lent by *lvalue* reference to an annotated
+        // consumer (spawn_tuple(mux), tmc::consume(mux)) is borrowed, not
+        // transferred: the callee awaits some unknowable number of its
+        // results. Escape rather than consume, so continued direct use —
+        // composing the same mux into further wrappers, get<>(), re-arming
+        // with fork() — stays valid. (An rvalue binding still transfers the
+        // whole obligation and consumes.)
+        if (Param->getType()->isLValueReferenceType() &&
+            typeIsDrainable(ArgTy)) {
+          escapeObject(ArgPI);
+          return;
+        }
+        // An annotated consumer taking a sentinel-parked object itself
+        // accepts the unproven drain rather than diagnosing a double
+        // consume.
+        if (dischargeParkedByObject(ArgPI, Arg->getExprLoc()))
+          return;
       }
       consumeObject(ArgPI, Arg->getExprLoc());
       if (CK == ConsumeKind::Structural)
@@ -1264,6 +1492,8 @@ public:
     // fall back to unconditional consumption at the binding.
     bool ResultTestable = Call->getType()->isBooleanType();
 
+    OpaqueDischargeState Opaque;
+
     for (unsigned Index = Offset; Index < Call->getNumArgs(); ++Index) {
       if (Index - Offset >= FunD->getNumParams())
         break;
@@ -1271,12 +1501,52 @@ public:
                             Call->getArg(Index), ConsumedContainers,
                             StructuralElemAttr, StructuralElemTy,
                             ResultTestable ? &CondParked : nullptr,
-                            ResultTestable ? &CondFresh : nullptr);
+                            ResultTestable ? &CondFresh : nullptr, &Opaque);
     }
     for (const VarDecl *Root : ConsumedContainers)
       consumeContainer(Root, Call->getExprLoc());
     if (!CondParked.empty() || !CondFresh.empty())
       registerCondConsume(Call, CondParked, CondFresh);
+
+    // A call that received both a pending result and the matching object's
+    // sentinel (`EXPECT_EQ(idx, mux.end())`) discharges the obligation: the
+    // callee is presumed to perform the drain check.
+    if (Opaque.PendingKey && Opaque.SentinelSeen) {
+      auto It = CondConsumeMap.find(Opaque.PendingKey);
+      if (It != CondConsumeMap.end() &&
+          It->second.SentinelObj == Opaque.SentinelSeen)
+        dischargeEntry(It, Call->getExprLoc());
+    }
+
+    // Borrow pass-through: a call that binds a tracked linear object to an
+    // lvalue-reference parameter (which does not consume it) and returns a
+    // reference to the same linear class hands the object back to the
+    // caller; the call's value is the object. This is how a coroutine
+    // promise's `await_transform(Awaitable&&)` forwards an lvalue-awaited
+    // linear object (a mux) to its awaiter member calls.
+    QualType BorrowRetTy = FunD->getReturnType();
+    if (BorrowRetTy->isReferenceType() &&
+        isLinearType(BorrowRetTy.getNonReferenceType())) {
+      const CXXRecordDecl *RetRD =
+          BorrowRetTy.getNonReferenceType()->getAsCXXRecordDecl();
+      for (unsigned Index = Offset; Index < Call->getNumArgs(); ++Index) {
+        if (Index - Offset >= FunD->getNumParams())
+          break;
+        PropagationInfo ArgPI = findInfo(Call->getArg(Index));
+        if (!ArgPI.isTracked())
+          continue;
+        QualType ArgTy = trackedType(ArgPI);
+        const CXXRecordDecl *ArgRD = ArgTy->getAsCXXRecordDecl();
+        if (!ArgRD || !RetRD ||
+            ArgRD->getCanonicalDecl() != RetRD->getCanonicalDecl())
+          continue;
+        if (paramConsumeKind(FunD->getParamDecl(Index - Offset), ArgTy) !=
+            ConsumeKind::None)
+          continue; // the binding consumed it; nothing to hand back
+        insertInfo(Call, ArgPI);
+        break;
+      }
+    }
 
     if (!ObjArg)
       return;
@@ -1304,10 +1574,25 @@ public:
     if (!ObjPI.isTracked())
       return;
 
+    // A sentinel provider (mux.end()): the call's value is the object's
+    // completion sentinel. Comparisons against it, and passing it alongside
+    // a pending awaited result, prove the object drained. The call is
+    // otherwise neutral.
+    if (const auto *SA = FunD->getAttr<LinearSentinelAttr>())
+      if (ObjPI.isVar() && linearTagMatches(SA->getTag(), trackedType(ObjPI)))
+        insertInfo(Call, PropagationInfo::makeSentinel(ObjPI.getVar()));
+
     if (const auto *CA = FunD->getAttr<LinearConsumerAttr>()) {
       if (linearTagMatches(CA->getTag(), trackedType(ObjPI))) {
-        if (CA->getMode() == LinearConsumerAttr::Conditional &&
-            Call->getType()->isBooleanType())
+        if (CA->getMode() == LinearConsumerAttr::Sentinel && ObjPI.isVar() &&
+            !FunD->getReturnType()->isVoidType())
+          // Drain-style consumption: consumed iff the result equals the
+          // object's sentinel. Parked from any state (awaiting a drained
+          // multiplexer is valid and returns the sentinel again).
+          registerCondConsume(Call, ObjPI, /*FreshTemps=*/{},
+                              /*SentinelObj=*/ObjPI.getVar());
+        else if (CA->getMode() == LinearConsumerAttr::Conditional &&
+                 Call->getType()->isBooleanType())
           registerCondConsume(Call, ObjPI);
         else
           consumeObject(ObjPI, Call->getExprLoc());
@@ -1370,7 +1655,8 @@ public:
       return;
     }
     Handler.warnNeverConsumed(E->getExprLoc(), StringRef(), E->getType(),
-                              E->getExprLoc(), /*IsParam=*/false);
+                              E->getExprLoc(), /*IsParam=*/false,
+                              typeIsDrainable(E->getType()));
   }
 
   //===--------------------------------------------------------------------===//
@@ -1455,16 +1741,22 @@ public:
       const auto *DRE =
           dyn_cast<DeclRefExpr>(canonicalExpr(BO->getLHS())->IgnoreImplicit());
       const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
-      // Assigning a conditional-consumer call's result into a bool variable
-      // (re)binds the variable to that call (`ok = tok.post(...)`, reusing a
-      // flag declared earlier); assigning anything else ends any prior
-      // association.
+      // Assigning a conditional-consumer call's result into a scalar
+      // variable (re)binds the variable to that call (`ok = tok.post(...)`
+      // reusing a flag declared earlier, `i = co_await mux` in a drain
+      // loop's increment); assigning a sentinel value (`e = mux.end()`)
+      // binds the variable to the drainable object; assigning anything else
+      // ends any prior association.
       if (VD) {
-        CondBoolVarMap.erase(VD);
-        if (VD->getType()->isBooleanType()) {
-          const Stmt *Key = stripCondWrappers(BO->getRHS());
-          if (CondConsumeMap.count(Key))
-            CondBoolVarMap[VD] = Key;
+        CondResultVarMap.erase(VD);
+        SentinelVarMap.erase(VD);
+        const Stmt *Key = stripCondWrappers(BO->getRHS());
+        if (CondConsumeMap.count(Key)) {
+          CondResultVarMap[VD] = Key;
+        } else {
+          PropagationInfo RHSSent = findInfo(BO->getRHS());
+          if (RHSSent.isSentinel())
+            SentinelVarMap[VD] = RHSSent.getSentinelVar();
         }
       }
       // Storing a derived pointer into a local pointer variable keeps the
@@ -1746,16 +2038,23 @@ public:
     if (!isLinearType(VarTy)) {
       if (!Var->hasInit())
         return;
-      // A bool variable capturing a conditional-consumer call's result:
-      // bool ok = token.post(std::move(t)); a later branch on it splits the
-      // parked state.
-      if (VarTy->isBooleanType()) {
+      // A scalar variable capturing a conditional-consumer call's result:
+      // bool ok = token.post(std::move(t)); size_t i = co_await mux; a
+      // later branch on it splits the parked state.
+      {
         const Stmt *Key = stripCondWrappers(Var->getInit());
-        if (CondConsumeMap.count(Key))
-          CondBoolVarMap[Var] = Key;
-        return;
+        if (CondConsumeMap.count(Key)) {
+          CondResultVarMap[Var] = Key;
+          return;
+        }
       }
       PropagationInfo InitPI = findInfo(Var->getInit());
+      // A variable holding a drainable object's sentinel value:
+      // auto e = mux.end();
+      if (InitPI.isSentinel()) {
+        SentinelVarMap[Var] = InitPI.getSentinelVar();
+        return;
+      }
       // An iterator variable obtained from a container: auto it =
       // vec.begin();
       if (InitPI.isContainerIter()) {
@@ -1822,6 +2121,17 @@ public:
         if (PI.isFresh() && !PI.isFreshEmpty())
           checkDiscardedFresh(E);
       }
+      // A pending conditional consumption registered by the awaiter's
+      // await_resume (a mux's sentinel-mode result) is the value of the
+      // whole co_await expression: re-key the entry so variables
+      // initialized from it (`size_t i = co_await mux`) and direct
+      // comparisons (`co_await mux == mux.end()`) resolve.
+      auto It = CondConsumeMap.find(canonicalExpr(Resume));
+      if (It != CondConsumeMap.end()) {
+        CondConsumeInfo Info = std::move(It->second);
+        CondConsumeMap.erase(It);
+        CondConsumeMap[canonicalExpr(E)] = std::move(Info);
+      }
     }
   }
 
@@ -1873,14 +2183,15 @@ public:
     if (!Info)
       return;
     bool IsParam = PI.isVar() && isa<ParmVarDecl>(PI.getVar());
+    bool IsDrain = typeIsDrainable(trackedType(PI));
     switch (Info->St) {
     case LinearInfo::LS_Unconsumed:
       Handler.warnNeverConsumed(Loc, trackedName(PI), trackedType(PI),
-                                Info->Loc, IsParam);
+                                Info->Loc, IsParam, IsDrain);
       break;
     case LinearInfo::LS_MaybeConsumed:
       Handler.warnMaybeNotConsumed(Loc, trackedName(PI), trackedType(PI),
-                                   Info->Loc, IsParam);
+                                   Info->Loc, IsParam, IsDrain);
       break;
     case LinearInfo::LS_Consumed:
       break;
@@ -2201,8 +2512,11 @@ public:
 
       // Branch-sensitive refinement for conditional consumers: if this
       // block's terminator tests the result of a conditional-consumer call,
-      // the parked arguments are consumed on the returned-true edge and
-      // still owned on the returned-false edge.
+      // the parked arguments are consumed on the consumed edge (returned
+      // true / result was the sentinel) and still owned on the other. A
+      // back-edge successor participates in the loop-head merge with its
+      // refined state (a do-while retry or drain loop's continue edge
+      // restores the pre-call state, matching the head's entry state).
       if (CurrBlock->succ_size() == 2 &&
           isBoolBranchTerminator(CurrBlock->getTerminatorStmt())) {
         if (const auto *Cond = dyn_cast_or_null<Expr>(
@@ -2212,48 +2526,40 @@ public:
               Visitor.resolveConditionalConsume(Cond, Negated);
           const CFGBlock *TrueSucc = *CurrBlock->succ_begin();
           const CFGBlock *FalseSucc = *(CurrBlock->succ_begin() + 1);
-          // Back-edge successors go through the loop-head merge instead of
-          // addInfo; skip the refinement for those (rare) shapes.
-          if (Split && TrueSucc && FalseSucc &&
-              !BlockInfo.isBackEdge(CurrBlock, TrueSucc) &&
-              !BlockInfo.isBackEdge(CurrBlock, FalseSucc)) {
+          if (Split && TrueSucc && FalseSucc && TrueSucc != FalseSucc) {
             auto FalseStates = std::make_unique<LinearStateMap>(*CurrStates);
-            // On the condition-true edge the call returned true unless the
+            // On the condition-true edge the call consumed unless the
             // condition negates the result an odd number of times.
             applyCondSplit(*CurrStates, *Split, /*CallReturnedTrue=*/!Negated);
             applyCondSplit(*FalseStates, *Split, /*CallReturnedTrue=*/Negated);
-            BlockInfo.addInfo(TrueSucc, CurrStates.get(), CurrStates);
-            BlockInfo.addInfo(FalseSucc, FalseStates.get(), FalseStates);
+            propagateToSuccessor(CurrBlock, TrueSucc, CurrStates.get(),
+                                 CurrStates);
+            propagateToSuccessor(CurrBlock, FalseSucc, FalseStates.get(),
+                                 FalseStates);
             CurrStates = nullptr;
             continue;
           }
         }
       }
 
-      // Propagate state to successors.
-      if (CurrBlock->succ_size() > 1 ||
-          (CurrBlock->succ_size() == 1 &&
-           (*CurrBlock->succ_begin())->pred_size() > 1)) {
+      // Propagate state to successors. The state is always handed over
+      // through the block-info table: reverse post-order does not guarantee
+      // that a block's single successor is visited immediately after it, so
+      // keeping the in-hand state for the "next" block can hand one branch's
+      // refined state to an unrelated block (observed with a drain loop
+      // whose break-edge block preceded the loop-body block in the
+      // ordering).
+      {
         LinearStateMap *RawState = CurrStates.get();
         for (CFGBlock::const_succ_iterator SI = CurrBlock->succ_begin(),
                                            SE = CurrBlock->succ_end();
              SI != SE; ++SI) {
           if (*SI == nullptr)
             continue;
-          if (BlockInfo.isBackEdge(CurrBlock, *SI)) {
-            if (LinearStateMap *HeadState = BlockInfo.borrowInfo(*SI)) {
-              HeadState->intersectAtLoopHead(CurrBlock, RawState, Handler);
-              if (BlockInfo.allBackEdgesVisited(CurrBlock, *SI))
-                BlockInfo.discardInfo(*SI);
-            }
-          } else {
-            BlockInfo.addInfo(*SI, RawState, CurrStates);
-          }
+          propagateToSuccessor(CurrBlock, *SI, RawState, CurrStates);
         }
         CurrStates = nullptr;
       }
-      // Otherwise: single successor that has a single predecessor. Reverse
-      // post-order visits it next, so keep CurrStates for it.
     }
 
     CurrStates = nullptr;
@@ -2271,29 +2577,50 @@ public:
   }
 
 private:
+  /// Hand a (possibly branch-refined) state map to one successor edge:
+  /// forward edges merge via addInfo (which takes ownership of \p OwnedState
+  /// when the successor has no state yet; \p RawState stays valid either
+  /// way); back edges participate in the loop-head state-mismatch check.
+  void propagateToSuccessor(const CFGBlock *CurrBlock, const CFGBlock *Succ,
+                            LinearStateMap *RawState,
+                            std::unique_ptr<LinearStateMap> &OwnedState) {
+    if (BlockInfo.isBackEdge(CurrBlock, Succ)) {
+      if (LinearStateMap *HeadState = BlockInfo.borrowInfo(Succ)) {
+        HeadState->intersectAtLoopHead(CurrBlock, RawState, Handler);
+        if (BlockInfo.allBackEdgesVisited(CurrBlock, Succ))
+          BlockInfo.discardInfo(Succ);
+      }
+    } else {
+      BlockInfo.addInfo(Succ, RawState, OwnedState);
+    }
+  }
+
   void sweepAtExit() {
     for (const auto &Entry : CurrStates->VarMap) {
       const VarDecl *Var = Entry.first;
       const LinearInfo &Info = Entry.second;
       bool IsParam = isa<ParmVarDecl>(Var);
       QualType Ty = Var->getType().getNonReferenceType();
+      bool IsDrain = typeIsDrainable(Ty);
       if (Info.St == LinearInfo::LS_Unconsumed)
         Handler.warnNeverConsumed(Var->getLocation(), varName(Var), Ty,
-                                  Info.Loc, IsParam);
+                                  Info.Loc, IsParam, IsDrain);
       else if (Info.St == LinearInfo::LS_MaybeConsumed)
         Handler.warnMaybeNotConsumed(Var->getLocation(), varName(Var), Ty,
-                                     Info.Loc, IsParam);
+                                     Info.Loc, IsParam, IsDrain);
     }
     for (const auto &Entry : CurrStates->TmpMap) {
       const CXXBindTemporaryExpr *Tmp = Entry.first;
       const LinearInfo &Info = Entry.second;
+      bool IsDrain = typeIsDrainable(Tmp->getType());
       if (Info.St == LinearInfo::LS_Unconsumed)
         Handler.warnNeverConsumed(Tmp->getExprLoc(), StringRef(),
-                                  Tmp->getType(), Info.Loc, /*IsParam=*/false);
+                                  Tmp->getType(), Info.Loc, /*IsParam=*/false,
+                                  IsDrain);
       else if (Info.St == LinearInfo::LS_MaybeConsumed)
         Handler.warnMaybeNotConsumed(Tmp->getExprLoc(), StringRef(),
                                      Tmp->getType(), Info.Loc,
-                                     /*IsParam=*/false);
+                                     /*IsParam=*/false, IsDrain);
     }
     // Tainted containers that reach the exit without a dtor CFG element
     // (trivially-destructible element types under NDEBUG).

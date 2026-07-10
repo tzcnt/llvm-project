@@ -4387,16 +4387,31 @@ def LinearConsumer : InheritableAttr {
   // This attribute only appertains to C++ functions and parameters.
   let Spellings = [Clang<"linear_consumer", 0>];
   let Subjects = SubjectList<[Function, ParmVar]>;
-  // The optional mode argument makes the consumption conditional on the
-  // annotated call returning true: on the returns-false branch the caller
-  // still owns the value.
+  // The optional mode argument makes the consumption conditional:
+  // `conditional` consumes only if the annotated call returns true (on the
+  // returns-false branch the caller still owns the value); `sentinel` (on a
+  // member function) consumes *this only when the call's result compares
+  // equal to the value of the class's [[clang::linear_sentinel]] member,
+  // e.g. a multiplexer that is drained once `co_await mux == mux.end()`.
   let Args = [StringArgument<"Tag", /*optional=*/1>,
               EnumArgument<"Mode", "ConsumeMode", /*is_string=*/false,
-                           ["unconditional", "conditional"],
-                           ["Unconditional", "Conditional"], /*opt=*/1>];
+                           ["unconditional", "conditional", "sentinel"],
+                           ["Unconditional", "Conditional", "Sentinel"],
+                           /*opt=*/1>];
   let StrictEnumParameters = 1;
   let LangOpts = [CPlusPlus];
   let Documentation = [LinearConsumerDocs];
+}
+
+def LinearSentinel : InheritableAttr {
+  // This attribute only appertains to C++ member functions. It marks the
+  // method whose return value is the completion sentinel that results of
+  // [[clang::linear_consumer("tag", sentinel)]] calls are compared against.
+  let Spellings = [Clang<"linear_sentinel", 0>];
+  let Subjects = SubjectList<[Function]>;
+  let Args = [StringArgument<"Tag", /*optional=*/1>];
+  let LangOpts = [CPlusPlus];
+  let Documentation = [LinearSentinelDocs];
 }
 
 def LinearProducer : InheritableAttr {

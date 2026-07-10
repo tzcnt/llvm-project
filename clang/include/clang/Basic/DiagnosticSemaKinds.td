@@ -4545,7 +4545,28 @@ def warn_linear_container_maybe_unconsumed : Warning<
 def warn_linear_container_already_consumed : Warning<
   "the linear contents of '%0' are %select{|potentially }1consumed a second "
   "time">, InGroup<LinearType>, DefaultError;
+def warn_linear_var_never_drained : Warning<
+  "linear %select{variable|parameter}2 '%0' of type %1 is never drained; "
+  "it must be awaited until it returns its end() sentinel (or passed to a "
+  "consuming operation) before it is destroyed">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_temp_never_drained : Warning<
+  "temporary of linear type %0 is never drained; it must be awaited until "
+  "it returns its end() sentinel (or passed to a consuming operation)">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_var_maybe_undrained : Warning<
+  "linear %select{variable|parameter}2 '%0' of type %1 is not proven "
+  "drained on every control-flow path; compare the awaited result against "
+  "the end() sentinel to prove completion">,
+  InGroup<LinearType>, DefaultError;
+def warn_linear_temp_maybe_undrained : Warning<
+  "temporary of linear type %0 is not proven drained on every control-flow "
+  "path; compare the awaited result against the end() sentinel to prove "
+  "completion">, InGroup<LinearType>, DefaultError;
 def note_linear_created_here : Note<"value created here">;
+def note_linear_awaited_here : Note<
+  "last awaited here; the result was not compared against the end() "
+  "sentinel on this path">;
 def note_linear_consumed_here : Note<"consumed here">;
 def note_linear_moved_into_container_here : Note<
   "linear value moved into the container here">;
@@ -4553,9 +4574,9 @@ def note_linear_param_declared_here : Note<
   "parameter declared here; the caller's argument binding consumed the "
   "value, so this function owns it">;
 def warn_linear_consumer_tag_mismatch : Warning<
-  "'linear_consumer' attribute on %0 does not consume anything: %select{its "
-  "tag does not match the 'linear' attribute tag on class %2|class %2 has no "
-  "'linear' attribute}1">, InGroup<LinearType>;
+  "%0 attribute on %1 has no effect: %select{its tag does not match the "
+  "'linear' attribute tag on class %3|class %3 has no 'linear' "
+  "attribute}2">, InGroup<LinearType>;
 
 // no_sanitize attribute
 def warn_unknown_sanitizer_ignored : Warning<

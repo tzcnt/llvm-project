@@ -46,16 +46,18 @@ public:
   /// A linear object is destroyed (or reaches the end of the function)
   /// without ever having been consumed. \p IsParam is true when the object
   /// is a function parameter whose consumption obligation was received from
-  /// the caller.
+  /// the caller. \p IsDrain is true when the type is consumed by draining
+  /// (it has a sentinel-mode linear_consumer member), which selects
+  /// drain-specific diagnostic wording.
   virtual void warnNeverConsumed(SourceLocation Loc, StringRef Name,
                                  QualType Ty, SourceLocation CreatedLoc,
-                                 bool IsParam) {}
+                                 bool IsParam, bool IsDrain) {}
 
   /// A linear object is destroyed but was only consumed on some of the
   /// control-flow paths that reach the destruction point.
   virtual void warnMaybeNotConsumed(SourceLocation Loc, StringRef Name,
                                     QualType Ty, SourceLocation ConsumedLoc,
-                                    bool IsParam) {}
+                                    bool IsParam, bool IsDrain) {}
 
   /// A linear object is consumed (or otherwise used as a consumable value)
   /// after it has (\p Maybe: may have) already been consumed. This covers

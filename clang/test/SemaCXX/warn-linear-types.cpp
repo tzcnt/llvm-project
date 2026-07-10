@@ -27,10 +27,10 @@ void observe(const Tok &t);
 
 // Attribute checking.
 struct NotLinear {
-  [[clang::linear_consumer("tok")]] void finish(); // expected-warning {{'linear_consumer' attribute on 'finish' does not consume anything: class 'NotLinear' has no 'linear' attribute}}
+  [[clang::linear_consumer("tok")]] void finish(); // expected-warning {{'clang::linear_consumer' attribute on 'finish' has no effect: class 'NotLinear' has no 'linear' attribute}}
 };
 struct [[clang::linear("other")]] WrongTag {
-  [[clang::linear_consumer("tok")]] void finish(); // expected-warning {{'linear_consumer' attribute on 'finish' does not consume anything: its tag does not match the 'linear' attribute tag on class 'WrongTag'}}
+  [[clang::linear_consumer("tok")]] void finish(); // expected-warning {{'clang::linear_consumer' attribute on 'finish' has no effect: its tag does not match the 'linear' attribute tag on class 'WrongTag'}}
 };
 
 // Clean usage: no diagnostics.
@@ -756,4 +756,275 @@ void err_cond_triv_temp_branched(ChanTriv &c) {
 }
 void ok_cond_triv_temp_discharged(ChanTriv &c) {
   discharge_triv(c.post(make_triv()));
+}
+
+// Sentinel-mode (drain-style) consumption:
+// [[clang::linear_consumer("tag", sentinel)]] consumes the object it is
+// invoked on only when the call's result compares equal to the value of the
+// class's [[clang::linear_sentinel]] member. Models multiplexers that must
+// be awaited until they report completion (co_await mux == mux.end()).
+using size_t = decltype(sizeof(0));
+
+class [[clang::linear("mux")]] Mux {
+public:
+  Mux();          // empty: does not require draining until fork()
+  explicit Mux(int); // eagerly armed
+  [[clang::linear_consumer("mux", sentinel)]] size_t await_resume();
+  [[clang::linear_sentinel("mux")]] size_t end() const;
+  [[clang::linear_producer("mux")]] void fork(int);
+  size_t operator[](size_t);
+  Mux(const Mux &) = delete;
+  Mux &operator=(const Mux &) = delete;
+  ~Mux();
+};
+template <typename... A> void consume_mux([[clang::linear_consumer("mux")]] A &&...);
+void expect_eq(size_t, size_t); // opaque comparison helper (EXPECT_EQ shape)
+void use(size_t);
+
+// Attribute misuse.
+struct NotLinearMux {
+  [[clang::linear_sentinel("mux")]] size_t end() const; // expected-warning {{'clang::linear_sentinel' attribute on 'end' has no effect: class 'NotLinearMux' has no 'linear' attribute}}
+};
+struct [[clang::linear("other2")]] WrongTagMux {
+  [[clang::linear_sentinel("mux")]] size_t end() const; // expected-warning {{'clang::linear_sentinel' attribute on 'end' has no effect: its tag does not match the 'linear' attribute tag on class 'WrongTagMux'}}
+};
+
+// The canonical drain loop is clean.
+void ok_mux_drain_for() {
+  Mux m(2);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+}
+// While-true with a break on the sentinel.
+void ok_mux_drain_break() {
+  Mux m(2);
+  while (true) {
+    size_t i = m.await_resume();
+    if (i == m.end())
+      break;
+    use(m[i]);
+  }
+}
+// Do-while drain: the split applies across the loop back edge.
+void ok_mux_drain_do_while() {
+  Mux m(2);
+  size_t i;
+  do {
+    i = m.await_resume();
+  } while (i != m.end());
+}
+// Assignment inside the condition.
+void ok_mux_assign_in_condition() {
+  Mux m(2);
+  size_t i;
+  while ((i = m.await_resume()) != m.end())
+    use(m[i]);
+}
+// Negations and literal-first comparisons resolve.
+void ok_mux_negated() {
+  Mux m(2);
+  size_t i = m.await_resume();
+  while (!(i == m.end()))
+    i = m.await_resume();
+}
+void ok_mux_sentinel_first() {
+  Mux m(1);
+  size_t i = m.await_resume();
+  while (m.end() != i)
+    i = m.await_resume();
+}
+// A cached sentinel variable works like the direct call.
+void ok_mux_cached_sentinel() {
+  Mux m(2);
+  auto e = m.end();
+  size_t i = m.await_resume();
+  while (i != e)
+    i = m.await_resume();
+}
+// Direct comparison of the call result (no variable).
+void ok_mux_direct_compare() {
+  Mux m(1);
+  if (m.await_resume() == m.end())
+    return;
+  size_t i = m.await_resume();
+  expect_eq(i, m.end());
+}
+// A drained mux may be re-awaited (it reports the sentinel again), and a
+// known number of results may be consumed untested as long as a later drain
+// is proven: sentinel-mode calls re-park from any state without diagnosing
+// double consumption.
+void ok_mux_count_then_drain() {
+  Mux m(3);
+  size_t a = m.await_resume();
+  size_t b = m.await_resume();
+  use(a);
+  use(b);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+}
+// fork() re-arms a drained (or empty) mux; a second drain proves it again.
+void ok_mux_fork_rearm() {
+  Mux m(2);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+  m.fork(0);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+}
+// An empty mux does not require draining; forking into it arms it.
+void ok_mux_empty() { Mux m; }
+void ok_mux_empty_fork_drain() {
+  Mux m;
+  m.fork(0);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+}
+// Passing the result and the object's sentinel together to one opaque call
+// (an equality-assertion helper) discharges the obligation.
+void ok_mux_opaque_compare() {
+  Mux m(1);
+  size_t i = m.await_resume();
+  expect_eq(i, m.end());
+}
+// Passing the mux itself to a matching-tag annotated consumer discharges,
+// even while parked by an untested await (the count-based escape hatch).
+void ok_mux_consume_parked() {
+  Mux m(2);
+  size_t i = m.await_resume();
+  use(i);
+  consume_mux(m);
+}
+// Discharging the pending *result* also releases the park (same idiom as
+// the bool mode's consume(post(...))).
+void ok_mux_result_discharge() {
+  Mux m(2);
+  size_t i = m.await_resume();
+  consume_mux(i);
+}
+
+// Never awaited.
+void err_mux_never_awaited() {
+  Mux m(2); // expected-note {{value created here}}
+} // expected-error {{linear variable 'm' of type 'Mux' is never drained; it must be awaited until it returns its end() sentinel (or passed to a consuming operation) before it is destroyed}}
+// Awaited, result never compared against the sentinel.
+void err_mux_unchecked_await() {
+  Mux m(2);
+  size_t i = m.await_resume(); // expected-note {{last awaited here; the result was not compared against the end() sentinel on this path}}
+  use(i);
+} // expected-error {{linear variable 'm' of type 'Mux' is not proven drained on every control-flow path; compare the awaited result against the end() sentinel to prove completion}}
+// Comparing against something other than the sentinel proves nothing; in
+// particular `i == 1` must not resolve as a boolean test of the result.
+void err_mux_wrong_compare() {
+  Mux m(2);
+  size_t i = m.await_resume(); // expected-note {{last awaited here}}
+  if (i == 1)
+    use(m[i]);
+} // expected-error {{linear variable 'm' of type 'Mux' is not proven drained on every control-flow path}}
+// Comparing against a *different* mux's sentinel proves nothing.
+void err_mux_cross_compare() {
+  Mux m1(2); // m1 is diagnosed
+  Mux m2(2);
+  size_t i = m1.await_resume(); // expected-note {{last awaited here}}
+  if (i == m2.end()) {
+  }
+  for (size_t j = m2.await_resume(); j != m2.end(); j = m2.await_resume())
+    use(j);
+} // expected-error {{linear variable 'm1' of type 'Mux' is not proven drained on every control-flow path}}
+// fork() after a proven drain re-arms the obligation.
+void err_mux_fork_rearm_leak() {
+  Mux m(2);
+  for (size_t i = m.await_resume(); i != m.end(); i = m.await_resume())
+    use(m[i]);
+  m.fork(0); // expected-note {{value created here}}
+} // expected-error {{linear variable 'm' of type 'Mux' is never drained}}
+// An opaque call without the sentinel does not discharge.
+void err_mux_opaque_no_sentinel() {
+  Mux m(2);
+  size_t i = m.await_resume(); // expected-note {{last awaited here}}
+  expect_eq(i, 3);
+} // expected-error {{linear variable 'm' of type 'Mux' is not proven drained on every control-flow path}}
+// The forked-but-never-drained empty mux.
+void err_mux_empty_fork_leak() {
+  Mux m;
+  m.fork(0); // expected-note {{value created here}}
+} // expected-error {{linear variable 'm' of type 'Mux' is never drained}}
+
+// The same tracking works through the coroutine await machinery: the mux is
+// forwarded by reference through the promise's await_transform (borrow
+// pass-through), the pending consumption is re-keyed to the co_await
+// expression, and `size_t i = co_await mux` ties `i` to it.
+namespace std {
+template <class Ret, typename... T>
+struct coroutine_traits { using promise_type = typename Ret::promise_type; };
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+template <> struct coroutine_handle<void> {
+  template <class P> coroutine_handle(coroutine_handle<P>) noexcept;
+  static coroutine_handle from_address(void *) noexcept;
+};
+struct suspend_never {
+  bool await_ready() noexcept;
+  void await_suspend(coroutine_handle<>) noexcept;
+  void await_resume() noexcept;
+};
+} // namespace std
+
+class [[clang::linear("mux")]] AwaitableMux {
+public:
+  AwaitableMux();
+  explicit AwaitableMux(int);
+  bool await_ready() const noexcept;
+  void await_suspend(std::coroutine_handle<>) noexcept;
+  [[clang::linear_consumer("mux", sentinel)]] size_t await_resume() noexcept;
+  AwaitableMux &operator co_await() & noexcept { return *this; }
+  [[clang::linear_sentinel("mux")]] size_t end() const noexcept;
+  [[clang::linear_producer("mux")]] void fork(int);
+  size_t operator[](size_t);
+  AwaitableMux(const AwaitableMux &) = delete;
+  AwaitableMux &operator=(const AwaitableMux &) = delete;
+  ~AwaitableMux();
+};
+
+struct CoroTask {
+  struct promise_type {
+    CoroTask get_return_object();
+    std::suspend_never initial_suspend();
+    std::suspend_never final_suspend() noexcept;
+    void return_void();
+    void unhandled_exception();
+    template <typename Awaitable>
+    decltype(auto) await_transform(Awaitable &&awaitable) noexcept {
+      return static_cast<Awaitable &&>(awaitable).operator co_await();
+    }
+  };
+};
+
+CoroTask ok_coro_mux_drain() {
+  AwaitableMux m(2);
+  for (size_t i = co_await m; i != m.end(); i = co_await m)
+    use(m[i]);
+}
+CoroTask ok_coro_mux_break() {
+  AwaitableMux m(2);
+  while (true) {
+    size_t i = co_await m;
+    if (i == m.end())
+      break;
+    use(m[i]);
+  }
+}
+CoroTask ok_coro_mux_direct() {
+  AwaitableMux m(1);
+  while ((co_await m) != m.end()) {
+  }
+}
+CoroTask err_coro_mux_unchecked() {
+  AwaitableMux m(2);
+  size_t i = co_await m; // expected-note {{last awaited here}}
+  use(i);
+} // expected-error {{linear variable 'm' of type 'AwaitableMux' is not proven drained on every control-flow path}}
+CoroTask err_coro_mux_never_awaited() {
+  AwaitableMux m(2); // expected-note {{value created here}}
+  co_return; // expected-error {{linear variable 'm' of type 'AwaitableMux' is never drained}}
 }

@@ -3932,7 +3932,10 @@ linear type otherwise receive, so the value's onward path inside the callee
 (for example, binding into a reference member of an object under
 construction) need not be provable to the analysis. An annotated
 lvalue-reference parameter also consumes its argument, which the structural
-rules alone never do.
+rules alone never do — except for drain-style types (classes with a
+``sentinel``-mode consumer member): those are *borrowed* when lent by lvalue
+reference, since the callee awaits an unknowable number of their results;
+tracking leniently ends and continued direct use of the object stays valid.
 
 The optional ``conditional`` mode, e.g.
 ``[[clang::linear_consumer("tag", conditional)]]``, declares that the
@@ -3967,6 +3970,32 @@ path is unreachable and deliberately ignore the result:
 A fresh temporary of a trivially-destructible linear type bound to a
 conditional consumer (``token.post(make_task())``) is always diagnosed
 unless so discharged: no handle exists that a failure branch could recover.
+
+The ``sentinel`` mode, e.g.
+``[[clang::linear_consumer("tag", sentinel)]]`` on a non-static member
+function, supports linear objects that are consumed by *draining*: the call
+consumes the object only when its result compares equal to the value of the
+class's ``clang::linear_sentinel``-annotated member. The canonical client is
+a result multiplexer whose ``await_resume()`` returns the index of one
+completed slot, or a sentinel once all slots have completed:
+
+.. code-block:: c++
+
+  for (size_t i = co_await mux; i != mux.end(); i = co_await mux)
+    use(mux[i]); // mux proven drained only on the == end() branch
+
+A sentinel-mode call never diagnoses double consumption; it re-parks the
+object from any state (awaiting an already-drained multiplexer is valid and
+returns the sentinel again, and consuming a known number of results without
+testing each one is valid as long as a later drain is proven). The object's
+state is split on ``==`` / ``!=`` comparisons between the call's result
+(directly, through a variable holding it, or through an assignment inside
+the condition) and the *same object's* sentinel member. Passing the result
+and the object's sentinel value together to any one function (for example an
+equality-assertion helper such as ``EXPECT_EQ(idx, mux.end())``) also
+discharges the obligation, as does passing the object itself to a
+matching-tag annotated consumer. If the drain is never proven, the object's
+death is diagnosed.
   }];
 }
 
@@ -3979,6 +4008,19 @@ object (again) holds a value that must be consumed exactly once. This supports
 reusable containers of linear values, e.g. a task group that can be refilled
 with ``add()`` after its previous contents were awaited. The optional string
 tag must match the tag of the ``clang::linear`` attribute on the class.
+  }];
+}
+
+def LinearSentinelDocs : Documentation {
+  let Category = DocCatConsumed;
+  let Content = [{
+The ``clang::linear_sentinel`` attribute marks the non-static member function
+of a class marked ``clang::linear`` whose return value is the completion
+sentinel for that class's drain-style consumption: results of calls to the
+class's ``[[clang::linear_consumer("tag", sentinel)]]`` member are compared
+against this member's value to prove the object fully consumed (see the
+``sentinel`` mode under ``clang::linear_consumer``). The optional string tag
+must match the tag of the ``clang::linear`` attribute on the class.
   }];
 }
 

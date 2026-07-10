@@ -949,6 +949,143 @@ void err_mux_empty_fork_leak() {
   m.fork(0); // expected-note {{value created here}}
 } // expected-error {{linear variable 'm' of type 'Mux' is never drained}}
 
+// Sentinel-mode drain refinement across a `switch` on the awaited result
+// (`switch (idx) { ... case mux.end(): ...; }`). A switch is not a
+// two-successor boolean branch, but when its condition is the pending result
+// of a drain-consumer call each outgoing edge is decidable from its case
+// label: the `case mux.end():` edge is taken only when the result equalled
+// the sentinel (drained), every other case and the default edge restore the
+// pre-await owned state. The label is a constant expression, so end() must be
+// constexpr to be usable as one; it must not read *this.
+class [[clang::linear("mux")]] SwMux {
+public:
+  explicit SwMux(int);
+  [[clang::linear_consumer("mux", sentinel)]] size_t await_resume();
+  [[clang::linear_sentinel("mux")]] constexpr size_t end() const { return 8; }
+  size_t operator[](size_t);
+  SwMux(const SwMux &) = delete;
+  SwMux &operator=(const SwMux &) = delete;
+  ~SwMux();
+};
+// A distinct drainable type whose sentinel is a different constant, for the
+// cross-object identity check.
+class [[clang::linear("mux")]] SwMux9 {
+public:
+  explicit SwMux9(int);
+  [[clang::linear_consumer("mux", sentinel)]] size_t await_resume();
+  [[clang::linear_sentinel("mux")]] constexpr size_t end() const { return 9; }
+  ~SwMux9();
+};
+
+// The batch-processor shape: a `case mux.end():` proves the drain; the other
+// cases restart work and loop. Clean.
+void ok_switch_drain() {
+  SwMux m(2);
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case 0: use(m[idx]); break;
+    case 1: use(m[idx]); break;
+    case m.end(): return;
+    }
+  }
+}
+// The idiomatic form with a `default:` that is *not* the drain: the drain is
+// the explicit `case mux.end():` and default just processes an active slot
+// and keeps looping. The default edge restores the owned state (so the loop
+// head stays consistent) without being mistaken for a drain.
+void ok_switch_drain_default_continues() {
+  SwMux m(2);
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case m.end(): return;
+    default: use(m[idx]); break;
+    }
+  }
+}
+// No `case end():` and no exit at all: the mux dtor is unreachable, so there
+// is nothing to leak. The back edge carries the restored owned state, so the
+// loop-iteration consistency check is also satisfied (no spurious mismatch).
+void ok_switch_no_end_infinite() {
+  SwMux m(2);
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case 0: use(m[idx]); break;
+    case 1: use(m[idx]); break;
+    }
+  }
+}
+// Soundness: a switch that exits on a *non-drain* edge leaves the mux owned,
+// and the leak is still reported at that exit. Restoring the owned state on
+// the non-drain edges never masks a leak.
+void err_switch_non_drain_exit() {
+  SwMux m(2); // expected-note {{value created here}}
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case 0:
+      return; // expected-error {{linear variable 'm' of type 'SwMux' is never drained; it must be awaited until it returns its end() sentinel (or passed to a consuming operation) before it is destroyed}}
+    case 1:
+      use(m[idx]);
+      break;
+    case m.end():
+      return;
+    }
+  }
+}
+// A `default:` cannot prove `idx == end()` (it also covers every other value),
+// so using it as the drain edge is a conservative false positive: rewrite as
+// an explicit `case mux.end():`.
+void err_switch_default_as_drain() {
+  SwMux m(2); // expected-note {{value created here}}
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case 0: use(m[idx]); break;
+    default:
+      return; // expected-error {{linear variable 'm' of type 'SwMux' is never drained}}
+    }
+  }
+}
+// Identity: a case label that is a *different* object's sentinel proves
+// nothing about this mux. 'm' must still be reported.
+void err_switch_cross_mux() {
+  SwMux m(2); // expected-note {{value created here}}
+  SwMux9 other(2);
+  consume_mux(other); // discharge 'other' so only 'm' is in question
+  while (true) {
+    size_t idx = m.await_resume();
+    switch (idx) {
+    case 0: use(m[idx]); break;
+    case other.end():
+      return; // expected-error {{linear variable 'm' of type 'SwMux' is never drained}}
+    }
+  }
+}
+// Soundness against stacked case labels: when the sentinel case shares its
+// body with a non-sentinel case, that body is reachable when idx != end()
+// (undrained). The CFG gives each label its own edge — the non-sentinel
+// case's edge restores the owned state and falls through into the shared
+// body — so the merge is maybe-consumed and the leak is still reported (not
+// silently treated as drained).
+void err_switch_stacked_sentinel() {
+  SwMux m(2);
+  while (true) {
+    size_t idx = m.await_resume(); // expected-note {{last awaited here; the result was not compared against the end() sentinel on this path}}
+    switch (idx) {
+    case 0:
+    case m.end():
+      use(m[idx]);
+      return; // expected-error {{linear variable 'm' of type 'SwMux' is not proven drained on every control-flow path}}
+    case 1:
+      use(m[idx]);
+      break;
+    }
+  }
+}
+
 // The same tracking works through the coroutine await machinery: the mux is
 // forwarded by reference through the promise's await_transform (borrow
 // pass-through), the pending consumption is re-keyed to the co_await

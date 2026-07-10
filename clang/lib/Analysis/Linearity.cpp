@@ -1189,6 +1189,46 @@ public:
     return Info;
   }
 
+  /// If \p Cond is a `switch` terminator's condition (`switch (idx)`) whose
+  /// value is the still-pending result of a sentinel-mode consumer call
+  /// (`idx = co_await mux`), return the parked-consumption record. Each
+  /// outgoing switch edge is then refined by its case label: the edge whose
+  /// label is the object's own `end()` proves the drain, every other case
+  /// (and the default / implicit-default edge) restores the pre-await owned
+  /// state — see caseLabelDrains and the switch handler in the analyzer.
+  const CondConsumeInfo *resolveSentinelSwitch(const Expr *Cond) const {
+    const CondConsumeInfo *Info = lookupPending(Cond);
+    if (!Info || !Info->isSentinel())
+      return nullptr;
+    return Info;
+  }
+
+  /// Does the `case` label \p Label test the awaited result against \p Obj's
+  /// own linear_sentinel value (`case mux.end():`)? Such an edge is taken
+  /// only when `idx == mux.end()`, i.e. the mux drained. The label is a
+  /// constant expression, so it is never a CFG element and cannot be looked
+  /// up in the propagation map; match it structurally, mirroring the
+  /// sentinel-provider detection in handleCall. \p Obj is the object the
+  /// pending sentinel-mode call parked, so identity (not just tag) must
+  /// match — `case other_mux.end():` proves nothing about this mux.
+  bool caseLabelDrains(const Stmt *Label, const VarDecl *Obj) const {
+    const auto *CS = dyn_cast_or_null<CaseStmt>(Label);
+    if (!CS || !CS->getLHS())
+      return false;
+    // stripCondWrappers peels the ConstantExpr wrapper (a FullExpr) and any
+    // implicit casts, leaving the `mux.end()` member call itself.
+    const auto *MCE =
+        dyn_cast<CXXMemberCallExpr>(stripCondWrappers(CS->getLHS()));
+    if (!MCE)
+      return false;
+    const CXXMethodDecl *MD = MCE->getMethodDecl();
+    if (!MD || !MD->hasAttr<LinearSentinelAttr>())
+      return false;
+    const auto *DRE = dyn_cast<DeclRefExpr>(
+        MCE->getImplicitObjectArgument()->IgnoreParenImpCasts());
+    return DRE && dyn_cast<VarDecl>(DRE->getDecl()) == Obj;
+  }
+
   /// If \p E refers to a local (non-reference) variable of linear type,
   /// return it as a trackable target, even if it is not currently tracked.
   /// Used to start tracking a variable when a value is stored into it
@@ -2539,6 +2579,37 @@ public:
             CurrStates = nullptr;
             continue;
           }
+        }
+      }
+
+      // Sentinel-mode refinement across a `switch` on the awaited result
+      // (`switch (idx) { ... case mux.end(): co_return; ... }`). A switch is
+      // not a two-successor boolean branch, but when its condition is the
+      // pending result of a drain-consumer call each outgoing edge is still
+      // decidable from its case label: the `case mux.end():` edge is taken
+      // only when the result equalled the sentinel (drained → Consumed);
+      // every other case, and the default / implicit-default edge, restores
+      // the pre-await owned state. Restoring the owned state (never Consumed)
+      // on the non-drain edges cannot mask a leak — a mux that leaves the
+      // loop undrained on such an edge still reaches the exit sweep owned and
+      // is reported there — while it does make the back edge carry the
+      // pre-await state, fixing the spurious loop-iteration mismatch.
+      if (const auto *Cond =
+              dyn_cast_or_null<Expr>(CurrBlock->getTerminatorCondition());
+          Cond && isa_and_nonnull<SwitchStmt>(CurrBlock->getTerminatorStmt())) {
+        if (const CondConsumeInfo *Split =
+                Visitor.resolveSentinelSwitch(Cond)) {
+          const VarDecl *Obj = Split->SentinelObj;
+          for (const CFGBlock *Succ : CurrBlock->succs()) {
+            if (!Succ)
+              continue;
+            bool Drains = Visitor.caseLabelDrains(Succ->getLabel(), Obj);
+            auto EdgeStates = std::make_unique<LinearStateMap>(*CurrStates);
+            applyCondSplit(*EdgeStates, *Split, /*CallReturnedTrue=*/Drains);
+            propagateToSuccessor(CurrBlock, Succ, EdgeStates.get(), EdgeStates);
+          }
+          CurrStates = nullptr;
+          continue;
         }
       }
 

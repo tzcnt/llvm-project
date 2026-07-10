@@ -47,6 +47,17 @@
 // death; the caller must branch on the result (or otherwise consume the
 // value) to prove the failure path handled.
 //
+// A conditional consumer may also return an *awaitable object* that defers
+// the result (an asynchronous channel push whose success bool arrives from
+// `co_await`). The arguments are parked at the call as above; when the
+// call's result is later co_awaited, the co_await expression attributes the
+// awaited value back to the call: a bool resume value re-keys the pending
+// consumption to the co_await expression (a later branch on it splits the
+// state as usual), and a void resume value completes the consumption
+// unconditionally (a bounded queue's suspending push, which always enqueues
+// once awaited). An awaitable that is never awaited, or whose awaited bool
+// is never tested, leaves the value MaybeConsumed — strict, as above.
+//
 // Container taint: moving a linear value into a non-linear local object
 // through an *unannotated* rvalue-reference or by-value parameter of a
 // member call (vec.push_back(std::move(t))) consumes the value but leaves
@@ -952,16 +963,9 @@ public:
   /// obligation was discharged.
   bool dischargeCondConsume(const Expr *Arg, StringRef Tag,
                             SourceLocation Loc) {
-    const Stmt *Key = stripCondWrappers(Arg);
-    if (const auto *DRE = dyn_cast<DeclRefExpr>(Key)) {
-      const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-      if (!VD)
-        return false;
-      auto VIt = CondResultVarMap.find(VD);
-      if (VIt == CondResultVarMap.end())
-        return false;
-      Key = VIt->second;
-    }
+    const Stmt *Key = lookupPendingKey(Arg);
+    if (!Key)
+      return false;
     auto It = CondConsumeMap.find(Key);
     if (It == CondConsumeMap.end())
       return false;
@@ -1045,12 +1049,13 @@ public:
     }
   }
 
-  /// If \p E (an operand within a branch condition or a call argument) ties
-  /// back to a pending conditional-consumer call — directly, through the
-  /// co_await hop (the entry is re-keyed to the CoawaitExpr), through an
-  /// assignment inside the condition (`(i = co_await mux)`), or through a
-  /// local variable initialized with the result — return the pending
-  /// entry's map key.
+  /// If \p E (an operand within a branch condition, a call argument, or a
+  /// co_await operand) ties back to a pending conditional-consumer call —
+  /// directly, through the co_await hop (the entry is re-keyed to the
+  /// CoawaitExpr), through an assignment inside the condition
+  /// (`(i = co_await mux)`), through std::move (`co_await std::move(aw)`),
+  /// or through a local variable initialized with the result — return the
+  /// pending entry's map key.
   const Stmt *lookupPendingKey(const Expr *E) const {
     E = stripCondWrappers(E);
     // `while ((i = co_await mux) != mux.end())`: the assignment's value is
@@ -1058,6 +1063,13 @@ public:
     if (const auto *BO = dyn_cast<BinaryOperator>(E);
         BO && BO->getOpcode() == BO_Assign)
       E = stripCondWrappers(BO->getRHS());
+    // `co_await std::move(aw)`, `tmc::consume(std::move(aw))`: identity
+    // functions pass the result through unchanged.
+    while (const auto *CE = dyn_cast<CallExpr>(E)) {
+      if (!isPassThroughCall(CE))
+        break;
+      E = stripCondWrappers(CE->getArg(0));
+    }
     const Stmt *Key = E;
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
       const auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
@@ -1528,9 +1540,13 @@ public:
     QualType StructuralElemTy;
     SmallVector<PropagationInfo, 1> CondParked;
     SmallVector<std::pair<SourceLocation, QualType>, 1> CondFresh;
-    // A conditional consumer with a non-bool result cannot be tested;
+    // A conditional consumer's result is testable when it is a bool, or when
+    // it is an object (an awaitable deferring the result: co_awaiting it
+    // later re-keys or discharges the pending consumption — see
+    // VisitCoroutineSuspendExpr). Any other result type cannot be tested;
     // fall back to unconditional consumption at the binding.
-    bool ResultTestable = Call->getType()->isBooleanType();
+    bool ResultTestable =
+        Call->getType()->isBooleanType() || Call->getType()->isRecordType();
 
     OpaqueDischargeState Opaque;
 
@@ -2150,6 +2166,7 @@ public:
   }
 
   void VisitCoroutineSuspendExpr(const CoroutineSuspendExpr *E) {
+    bool ReKeyed = false;
     // The operand is consumed via the await_transform / operator co_await
     // calls that are linearized separately in the CFG. The co_await
     // expression's own value is whatever await_resume() returned; forward it
@@ -2171,6 +2188,32 @@ public:
         CondConsumeInfo Info = std::move(It->second);
         CondConsumeMap.erase(It);
         CondConsumeMap[canonicalExpr(E)] = std::move(Info);
+        ReKeyed = true;
+      }
+    }
+    // Cross-awaitable attribution for a conditional consumer that returned
+    // an awaitable (`co_await tok.push(std::move(t))`): the arguments were
+    // parked at the call; the co_await expression is where the language
+    // ties that call's result to the awaited value. A bool resume value is
+    // the deferred success result: re-key the pending entry to the co_await
+    // expression so a later branch on it splits the state. A void resume
+    // value means awaiting completes the consumption unconditionally (a
+    // bounded queue's suspending push): discharge the entry. Any other
+    // resume type proves nothing, and the pending obligation stays strict.
+    // Sentinel-mode entries never key on the operand (their objects are
+    // awaited directly and handled above).
+    if (!ReKeyed) {
+      if (const Stmt *OpKey = lookupPendingKey(E->getOperand())) {
+        auto It = CondConsumeMap.find(OpKey);
+        if (It != CondConsumeMap.end() && !It->second.isSentinel()) {
+          if (E->getType()->isBooleanType()) {
+            CondConsumeInfo Info = std::move(It->second);
+            CondConsumeMap.erase(It);
+            CondConsumeMap[canonicalExpr(E)] = std::move(Info);
+          } else if (E->getType()->isVoidType()) {
+            dischargeEntry(It, E->getExprLoc());
+          }
+        }
       }
     }
   }

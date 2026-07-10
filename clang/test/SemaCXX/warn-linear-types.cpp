@@ -1165,3 +1165,118 @@ CoroTask err_coro_mux_never_awaited() {
   AwaitableMux m(2); // expected-note {{value created here}}
   co_return; // expected-error {{linear variable 'm' of type 'AwaitableMux' is never drained}}
 }
+
+// Deferred conditional consumption through an awaitable: a conditional
+// consumer that returns an awaitable object parks its arguments at the
+// call; co_awaiting the result attributes the awaited value back to the
+// call. A bool resume value is the deferred success result — test it like
+// any conditional result. A void resume value completes the consumption at
+// the await (an always-enqueues bounded-queue push). Any other resume type
+// proves nothing. An awaitable that is never awaited, or an awaited bool
+// that is never tested, leaves the value unproven (strict).
+struct BoolPushResult {
+  bool await_ready() const noexcept;
+  void await_suspend(std::coroutine_handle<>) noexcept;
+  bool await_resume() noexcept;
+};
+struct BoolPushAwaitable {
+  BoolPushResult operator co_await() && noexcept;
+};
+struct VoidPushResult {
+  bool await_ready() const noexcept;
+  void await_suspend(std::coroutine_handle<>) noexcept;
+  void await_resume() noexcept;
+};
+struct VoidPushAwaitable {
+  VoidPushResult operator co_await() && noexcept;
+};
+struct IntPushResult {
+  bool await_ready() const noexcept;
+  void await_suspend(std::coroutine_handle<>) noexcept;
+  int await_resume() noexcept;
+};
+struct IntPushAwaitable {
+  IntPushResult operator co_await() && noexcept;
+};
+struct AsyncChan {
+  BoolPushAwaitable push([[clang::linear_consumer("tok", conditional)]] Tok &&t);
+  VoidPushAwaitable push_always([[clang::linear_consumer("tok", conditional)]] Tok &&t);
+  IntPushAwaitable push_int([[clang::linear_consumer("tok", conditional)]] Tok &&t);
+};
+
+CoroTask ok_push_fallback(AsyncChan &c) {
+  Tok t = make();
+  if (!co_await c.push(std::move(t)))
+    t.finish();
+}
+CoroTask ok_push_else(AsyncChan &c) {
+  Tok t = make();
+  if (co_await c.push(std::move(t))) {
+  } else {
+    t.finish();
+  }
+}
+CoroTask ok_push_bool_var(AsyncChan &c) {
+  Tok t = make();
+  bool ok = co_await c.push(std::move(t));
+  if (!ok)
+    t.finish();
+}
+CoroTask ok_push_awaitable_var(AsyncChan &c) {
+  Tok t = make();
+  auto aw = c.push(std::move(t));
+  if (!co_await std::move(aw))
+    t.finish();
+}
+CoroTask ok_push_retry(AsyncChan &c) {
+  Tok t = make();
+  while (!co_await c.push(std::move(t))) {
+  }
+}
+// Deliberate ignore: discharging the awaited result.
+CoroTask ok_push_result_discharged(AsyncChan &c) {
+  Tok t = make();
+  discharge(co_await c.push(std::move(t)));
+}
+// Awaiting a void-resume awaitable completes the consumption; there is
+// nothing to test.
+CoroTask ok_void_push(AsyncChan &c) {
+  Tok t = make();
+  co_await c.push_always(std::move(t));
+}
+CoroTask err_push_result_ignored(AsyncChan &c) {
+  Tok t = make();
+  co_await c.push(std::move(t)); // expected-note {{consumed here}}
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+CoroTask err_push_never_awaited(AsyncChan &c) {
+  Tok t = make();
+  auto aw = c.push(std::move(t)); // expected-note {{consumed here}}
+  co_return; // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+}
+CoroTask err_push_failure_drops(AsyncChan &c) {
+  Tok t = make();
+  if (!co_await c.push(std::move(t))) { // expected-note {{consumed here}}
+    /* t still owned here, then dropped */
+  }
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}
+CoroTask err_push_use_after_success(AsyncChan &c) {
+  Tok t = make();
+  if (co_await c.push(std::move(t))) // expected-note {{consumed here}}
+    t.finish(); // expected-error {{linear variable 't' of type 'Tok' is used after being consumed}}
+  else
+    sink(std::move(t));
+}
+// A temporary argument is unrecoverable on the failure path even when the
+// result is tested: it dies at the end of the full-expression, before the
+// branch.
+CoroTask err_push_temporary(AsyncChan &c) {
+  if (!co_await c.push(make())) { // expected-error {{temporary of linear type 'Tok' is not consumed on every control-flow path}} expected-note {{consumed here}}
+  }
+}
+// A non-bool, non-void resume type cannot deliver the result; the pending
+// obligation stays strict.
+CoroTask err_push_int_resume(AsyncChan &c) {
+  Tok t = make();
+  int n = co_await c.push_int(std::move(t)); // expected-note {{consumed here}}
+  use(n);
+} // expected-error {{linear variable 't' of type 'Tok' is not consumed on every control-flow path}}

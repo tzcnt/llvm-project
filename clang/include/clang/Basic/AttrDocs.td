@@ -3954,18 +3954,39 @@ initialized with it), so the canonical fallback pattern
 
 checks cleanly, and dropping the value on the returns-false path is
 diagnosed. If the result is never tested, the value counts as consumed on
-only some paths, which is diagnosed when it dies. A ``conditional`` consumer
-that does not return ``bool`` consumes unconditionally, as if the mode were
-absent.
+only some paths, which is diagnosed when it dies.
 
-Passing the call's result (or the ``bool`` variable holding it) to a
+A ``conditional`` consumer may instead return an *awaitable object* that
+defers the result (an asynchronous channel push whose success ``bool``
+arrives from ``co_await``). The arguments are parked at the call as above;
+``co_await``-ing the returned object (directly, through ``std::move``, or
+through a local variable holding it) attributes the awaited value back to
+the call. An awaited ``bool`` is the deferred success result and is tested
+exactly like a direct one:
+
+.. code-block:: c++
+
+  if (!co_await token.push(std::move(t)))
+    consume_locally(std::move(t)); // channel closed: still owned here
+
+An awaited ``void`` completes the consumption at the ``co_await`` itself
+(a bounded queue's suspending push, which always enqueues once awaited).
+Any other awaited type proves nothing, and an awaitable that is never
+awaited — or an awaited ``bool`` that is never tested — leaves the value
+consumed on only some paths, which is diagnosed when it dies. A
+``conditional`` consumer whose result is neither ``bool`` nor a class type
+consumes unconditionally, as if the mode were absent.
+
+Passing the call's result (the ``bool`` variable holding it, the returned
+awaitable, or the awaited ``bool`` of a deferred consumer) to a
 matching-tag ``linear_consumer``-annotated parameter *discharges* the
 pending obligation — the escape hatch for callers that know the failure
 path is unreachable and deliberately ignore the result:
 
 .. code-block:: c++
 
-  consume(token.post(std::move(t))); // failure deliberately unhandled
+  consume(token.post(std::move(t)));          // failure deliberately unhandled
+  consume(co_await token.push(std::move(t))); // same, across the co_await
 
 A fresh temporary of a trivially-destructible linear type bound to a
 conditional consumer (``token.post(make_task())``) is always diagnosed
